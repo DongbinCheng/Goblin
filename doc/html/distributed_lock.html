@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Goblin · Distributed Lock</title>
+<style>
+  :root { --goblin:#aef3f5; --goblin-stroke:#1c8c93; --client1:#fff2a8; --accent:#d6336c; --ink:#1b1b1b; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  .wrap { max-width:1100px; margin:0 auto; padding:24px 16px 40px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  p.sub { color:#555; margin:0 0 20px; }
+  svg { width:100%; height:auto; display:block; }
+  .label { font:600 16px/1.3 inherit; }
+  .small { font:13px/1.3 inherit; fill:#444; }
+  .accent { fill:var(--accent); font-weight:700; }
+  .box-text { font:14px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  .flow { stroke:#8a8a8a; stroke-width:2; fill:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Distributed Lock</h1>
+  <p class="sub">Implemented with put-if-not-exists + TTL. Only one client acquires the key; the lock auto-renews or expires after TTL.</p>
+  <svg viewBox="0 0 1000 560" role="img" aria-label="Distributed lock diagram">
+    <defs>
+      <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#8a8a8a"/>
+      </marker>
+    </defs>
+
+    <!-- ===== Top: lock with explicit TTL ===== -->
+    <circle cx="90" cy="150" r="32" fill="var(--client1)" stroke="#caa800"/>
+    <text x="90" y="200" text-anchor="middle" class="small">Client</text>
+
+    <path d="M122,138 C220,110 300,120 388,130" class="flow" marker-end="url(#arrow)"/>
+    <text x="150" y="110" class="small">lock (lock_key, <tspan class="accent">TTL</tspan>)</text>
+
+    <path d="M390,205 C300,235 210,200 124,166" class="flow" marker-end="url(#arrow)"/>
+
+    <path d="M390,40 a150,24 0 0 0 300,0 v180 a150,24 0 0 1 -300,0 Z" fill="var(--goblin)" stroke="var(--goblin-stroke)" stroke-width="2"/>
+    <ellipse cx="540" cy="40" rx="150" ry="24" fill="var(--goblin)" stroke="var(--goblin-stroke)" stroke-width="2"/>
+    <text x="540" y="78" text-anchor="middle" class="label">Goblin</text>
+
+    <rect x="410" y="105" width="260" height="36" fill="#fff" stroke="#333"/>
+    <text x="420" y="128" class="box-text" font-size="12">{lock_key} ==&gt; {metaInfo_version_TTL_deadline_value}</text>
+
+    <rect x="410" y="155" width="270" height="50" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="7 5"/>
+    <text x="420" y="178" class="box-text" font-size="12">If (<tspan class="accent">lock_key not exist</tspan>) { add a KV and return <tspan class="accent">success</tspan>; }</text>
+    <text x="420" y="196" class="box-text" font-size="12">else { return failure; }</text>
+
+    <!-- ===== Bottom: lock with default TTL + renew ===== -->
+    <circle cx="90" cy="420" r="32" fill="var(--client1)" stroke="#caa800"/>
+    <text x="90" y="470" text-anchor="middle" class="small">Client</text>
+
+    <path d="M122,408 C220,388 300,392 388,400" class="flow" marker-end="url(#arrow)"/>
+    <text x="170" y="388" class="small">lock(lock_key)</text>
+
+    <path d="M390,330 a150,24 0 0 0 300,0 v140 a150,24 0 0 1 -300,0 Z" fill="var(--goblin)" stroke="var(--goblin-stroke)" stroke-width="2"/>
+    <ellipse cx="540" cy="330" rx="150" ry="24" fill="var(--goblin)" stroke="var(--goblin-stroke)" stroke-width="2"/>
+    <text x="540" y="368" text-anchor="middle" class="label">Goblin</text>
+
+    <rect x="410" y="392" width="270" height="36" fill="#fff" stroke="#333"/>
+    <text x="420" y="415" class="box-text" font-size="12">{lock_key} ==&gt; {metaInfo_version_<tspan class="accent">defaultTTL</tspan>_deadline_value}</text>
+
+    <path d="M120,452 C260,520 400,470 470,430" class="flow" marker-end="url(#arrow)"/>
+    <text x="210" y="520" class="small">Renew lock</text>
+  </svg>
+</div>
+</body>
+</html>

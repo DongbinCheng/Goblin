@@ -52,7 +52,7 @@ client.commitTransaction(txn2);
 ```
 
 ## Design
-![Transaction](images/transaction.png)
+📊 [Open the Transaction graph (HTML)](html/transaction.html)
 
 ## How it works
 1. Client starts a transaction, then do some operations, and finally commits the transaction.

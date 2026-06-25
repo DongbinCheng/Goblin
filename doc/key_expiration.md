@@ -7,7 +7,7 @@ After the TTL value expires, the key will be deleted automatically.
 Refer to [Client API Reference](client_api_reference.md) for detail
 
 ## Design
-![key expiration](images/key_expiration.png)
+📊 [Open the Key Expiration graph (HTML)](html/key_expiration.html)
 
 ## How it works
 1. Client specifies a TTL when writing a key-value pair. Server calculates the deadline of the key-value pair and stores it in the key-value store. 

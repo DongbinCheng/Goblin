@@ -64,7 +64,7 @@ Performance metrics below are all based on payload size 1KB.
 
 ### Performance Tendency
 #### Workload at 100% Write
-![Write](images/write.png)
+📊 [Open the Write throughput & latency graph (HTML)](html/write.html)
 
 #### Workload at 100% Read
-![Read](images/read.png)
+📊 [Open the Read throughput & latency graph (HTML)](html/read.html)

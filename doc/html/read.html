@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Goblin · Read Throughput &amp; Latencies</title>
+<style>
+  :root { --p50:#3b76d6; --p99:#d64531; --ink:#1b1b1b; --grid:#d9d9d9; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  .wrap { max-width:880px; margin:0 auto; padding:24px 16px 40px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  p.sub { color:#555; margin:0 0 16px; }
+  svg { width:100%; height:auto; display:block; }
+  .axis { stroke:#333; stroke-width:1.5; }
+  .grid { stroke:var(--grid); stroke-width:1; }
+  .tick { font:12px/1 inherit; fill:#444; }
+  .axis-title { font:600 14px/1 inherit; fill:#333; }
+  table { border-collapse:collapse; margin-top:18px; font-size:14px; }
+  th,td { border:1px solid #ccc; padding:6px 12px; text-align:right; }
+  th { background:#f5f5f5; }
+  .legend { font:600 13px/1 inherit; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Throughput and Latencies (Read)</h1>
+  <p class="sub">Latency (ms) vs. throughput (reads/sec), payload size 1KB.</p>
+  <svg viewBox="0 0 760 440" role="img" aria-label="Read throughput and latency line chart">
+    <!-- plot area: x 80..720 (640 wide), y 40..360 (320 tall) -->
+    <!-- x: 0..28000 ; y: 0..12 -->
+    <rect x="300" y="14" width="13" height="13" fill="var(--p50)"/><text x="320" y="25" class="legend">p50</text>
+    <rect x="400" y="14" width="13" height="13" fill="var(--p99)"/><text x="420" y="25" class="legend">p99</text>
+
+    <!-- gridlines + y ticks (0,2,...,12) -->
+    <g>
+      <line class="grid" x1="80" y1="360" x2="720" y2="360"/><text class="tick" x="72" y="364" text-anchor="end">0</text>
+      <line class="grid" x1="80" y1="307" x2="720" y2="307"/><text class="tick" x="72" y="311" text-anchor="end">2</text>
+      <line class="grid" x1="80" y1="253" x2="720" y2="253"/><text class="tick" x="72" y="257" text-anchor="end">4</text>
+      <line class="grid" x1="80" y1="200" x2="720" y2="200"/><text class="tick" x="72" y="204" text-anchor="end">6</text>
+      <line class="grid" x1="80" y1="147" x2="720" y2="147"/><text class="tick" x="72" y="151" text-anchor="end">8</text>
+      <line class="grid" x1="80" y1="93"  x2="720" y2="93"/><text class="tick" x="72" y="97"  text-anchor="end">10</text>
+      <line class="grid" x1="80" y1="40"  x2="720" y2="40"/><text class="tick" x="72" y="44"  text-anchor="end">12</text>
+    </g>
+
+    <!-- axes -->
+    <line class="axis" x1="80" y1="40" x2="80" y2="360"/>
+    <line class="axis" x1="80" y1="360" x2="720" y2="360"/>
+
+    <!-- x ticks -->
+    <g class="tick" text-anchor="middle">
+      <text x="80"  y="380">1800</text>
+      <text x="148" y="380">4800</text>
+      <text x="217" y="380">7800</text>
+      <text x="286" y="380">10800</text>
+      <text x="354" y="380">13800</text>
+      <text x="423" y="380">16800</text>
+      <text x="492" y="380">19800</text>
+      <text x="560" y="380">22800</text>
+      <text x="629" y="380">25800</text>
+    </g>
+
+    <!-- mapping: x = 80 + throughput/28000*640 ; y = 360 - latency/12*320 -->
+    <!-- p99: (1906,0.45)->(124,348) (16321,0.67)->(453,342) (26139,10.3)->(677,85) -->
+    <polyline points="124,348 453,342 677,85" fill="none" stroke="var(--p99)" stroke-width="2.5"/>
+    <g fill="var(--p99)"><rect x="119" y="343" width="10" height="10"/><rect x="448" y="337" width="10" height="10"/><rect x="672" y="80" width="10" height="10"/></g>
+
+    <!-- p50: (1906,0.25)->(124,353) (16321,0.24)->(453,354) (26139,1.4)->(677,323) -->
+    <polyline points="124,353 453,354 677,323" fill="none" stroke="var(--p50)" stroke-width="2.5"/>
+    <g fill="var(--p50)"><rect x="119" y="348" width="10" height="10"/><rect x="448" y="349" width="10" height="10"/><rect x="672" y="318" width="10" height="10"/></g>
+
+    <text class="axis-title" x="400" y="412" text-anchor="middle">Throughput (reads/sec)</text>
+    <text class="axis-title" x="26" y="200" text-anchor="middle" transform="rotate(-90 26 200)">Latency (ms)</text>
+  </svg>
+
+  <table>
+    <thead><tr><th>Throughput</th><th>p50 latency (ms)</th><th>p99 latency (ms)</th></tr></thead>
+    <tbody>
+      <tr><td>1906</td><td>0.25</td><td>0.45</td></tr>
+      <tr><td>16321</td><td>0.24</td><td>0.67</td></tr>
+      <tr><td>26139</td><td>1.4</td><td>10.3</td></tr>
+    </tbody>
+  </table>
+</div>
+</body>
+</html>

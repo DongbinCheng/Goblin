@@ -37,7 +37,7 @@ CasResponse casWithTTL(KeyType key, ValueType value, long comparedVersion) throw
 ```
 
 ## Design
-![CAS](images/cas.png)
+📊 [Open the CAS graph (HTML)](html/cas.html)
 
 ## How it works
 1. When client updates a key-value pair, it sets an expected version of the target key as a condition in the request. 

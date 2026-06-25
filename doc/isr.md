@@ -32,7 +32,7 @@ goblin.client.pool.ISR.leaseTime=600000
 ```
 
 ## Design
-![ISR](images/isr.png)
+📊 [Open the ISR graph (HTML)](html/isr.html)
 
 ## How it works
 1. Leader exposes all the followers’ offsets in an API.

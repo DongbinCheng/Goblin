@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Goblin · Transaction</title>
+<style>
+  :root { --goblin:#aef3f5; --goblin-stroke:#1c8c93; --client1:#fff2a8; --accent:#d6336c; --ink:#1b1b1b; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; color:var(--ink); background:#fff; }
+  .wrap { max-width:1100px; margin:0 auto; padding:24px 16px 40px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  p.sub { color:#555; margin:0 0 20px; }
+  svg { width:100%; height:auto; display:block; }
+  .label { font:600 16px/1.3 inherit; }
+  .small { font:13px/1.3 inherit; fill:#444; }
+  .step { font:15px/1.3 inherit; fill:#222; }
+  .box-text { font:15px/1.3 inherit; fill:#222; }
+  .flow { stroke:#8a8a8a; stroke-width:2; fill:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Transaction (MiniTransaction)</h1>
+  <p class="sub">Run multiple operations atomically; keys are locked, operations applied, then unlocked.</p>
+  <svg viewBox="0 0 1000 380" role="img" aria-label="Transaction diagram">
+    <defs>
+      <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#8a8a8a"/>
+      </marker>
+    </defs>
+
+    <!-- Client -->
+    <circle cx="95" cy="190" r="34" fill="var(--client1)" stroke="#caa800"/>
+    <text x="95" y="245" text-anchor="middle" class="small">Client</text>
+
+    <!-- Steps in the middle -->
+    <text x="370" y="120" text-anchor="middle" class="step">Begin transaction</text>
+    <text x="370" y="148" text-anchor="middle" class="step">Read D</text>
+    <text x="370" y="176" text-anchor="middle" class="step">Write A</text>
+    <text x="370" y="204" text-anchor="middle" class="step">Read B</text>
+    <text x="370" y="232" text-anchor="middle" class="step">Write C</text>
+    <text x="370" y="260" text-anchor="middle" class="step">Commit transaction</text>
+
+    <line x1="129" y1="190" x2="560" y2="190" class="flow" marker-end="url(#arrow)"/>
+
+    <!-- Goblin cylinder -->
+    <path d="M610,80 a150,26 0 0 0 300,0 v220 a150,26 0 0 1 -300,0 Z" fill="var(--goblin)" stroke="var(--goblin-stroke)" stroke-width="2"/>
+    <ellipse cx="760" cy="80" rx="150" ry="26" fill="var(--goblin)" stroke="var(--goblin-stroke)" stroke-width="2"/>
+    <text x="760" y="120" text-anchor="middle" class="label">Goblin</text>
+
+    <rect x="640" y="150" width="240" height="140" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="7 5"/>
+    <text x="660" y="185" class="box-text">Lock A, B, C, D</text>
+    <text x="660" y="228" class="box-text">Do operations</text>
+    <text x="660" y="270" class="box-text">Release Lock A, B, C, D</text>
+  </svg>
+</div>
+</body>
+</html>

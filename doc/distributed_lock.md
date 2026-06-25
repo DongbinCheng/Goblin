@@ -37,7 +37,7 @@ boolean unlock(String key) throws GoblinException;
 ```
 
 ## Design
-![distributed lock](images/distributed_lock.png)
+📊 [Open the Distributed Lock graph (HTML)](html/distributed_lock.html)
 
 1. Distributed lock is implemented by writing a KV with TTL
 2. Clients compete for the lock by writing the same key. Only one client can successfully write the KV, and it gets the lock.

@@ -68,7 +68,7 @@ assertArrayEquals(getResponse3.getValue().get().getContent(), "testTransValue_su
 ```
 
 ## How it works
-![UDM example](images/udm.png)
+📊 [Open the UDM graph (HTML)](html/udm.html)
 
 In order to keep the latest account balances in Goblin, we update balance for an account on condition that the target seqNum in the request is bigger than the existing one.
 
