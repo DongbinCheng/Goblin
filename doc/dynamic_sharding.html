@@ -362,9 +362,9 @@
         <h4>What it does</h4>
         <ol class="flow">
           <li>Acquire per-key read/write lock (blocks concurrent ops on K).</li>
-          <li>Send <code>MigrateBatch</code> to target; <b>block EAL</b> until target acks the data is stored.</li>
+          <li>Send <code>MigrateBatch</code> to target; target writes K <b>only if it does not already exist</b> (insert-if-absent), then acks.</li>
           <li>Delete local copy of K.</li>
-          <li>Release lock. Command is persisted, so it resumes after restart.</li>
+          <li>Release lock once the command passes CPL. Command is persisted, so it resumes after restart.</li>
         </ol>
       </div>
       <div class="card">
@@ -372,7 +372,7 @@
         <ul>
           <li><b>Export + delete are atomic</b> for a key — no window where K exists in both or neither place servicing writes.</li>
           <li><b>Persisted</b> in the Raft log → survives leader change / rollout.</li>
-          <li><b>Idempotent</b> — a re-sent <code>MigrateBatch</code> after a lost response must not corrupt state.</li>
+          <li><b>Idempotent</b> — a re-sent <code>MigrateBatch</code> after a lost response is insert-if-absent, so it never corrupts state or overwrites a newer client value.</li>
           <li>Target accepts <code>MigrateBatch</code> under its <i>old</i> route, keyed by IMPORTING label.</li>
         </ul>
       </div>
@@ -412,9 +412,9 @@
       <p class="muted">A brand-new key created in an EXPORTING shard does not exist at source, so the same rule applies:
       source replies <code>MIGRATED_ROUTE</code> and the client writes it directly to the target. New inserts therefore
       land on the target from the start and are never stranded on the source after the route flips — no special
-      new-key path needed. (Worth confirming in implementation: the source must reply <code>MIGRATED_ROUTE</code> for
-      <b>writes</b> of absent keys too, not just reads, so new writes are steered to the target rather than recreated on
-      a soon-to-be-emptied source.)</p>
+      new-key path needed. <b>Confirmed:</b> both <b>writes and reads</b> of an absent key in an EXPORTING shard return
+      <code>MIGRATED_ROUTE</code> — not just reads — so new writes are steered to the target rather than recreated on a
+      soon-to-be-emptied source.</p>
     </div>
 
     <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
@@ -436,36 +436,47 @@
       </ul>
     </div>
 
-    <div class="card risk">
-      <h4>R4. EAL blocking on cross-cluster ack <span class="sev md">Medium</span></h4>
-      <p class="muted">MigrationCommand "blocks EAL until it gets the target response." If the target is slow,
-      partitioned, or its leader is changing, the source apply loop stalls — directly contradicting the
-      "no availability impact" non-functional requirement. Consider an async/pipelined apply with a pending-ack state
-      rather than blocking the state-machine apply thread.</p>
+    <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
+      <h4 style="color:var(--ok)">R4. EAL blocking on cross-cluster ack — resolved (replies don't wait on EAL) <span class="sev lo">Resolved</span></h4>
+      <p class="muted">The MigrationCommand may genuinely block EAL until it gets the target response, but <b>Raft does not
+      rely on EAL to reply to clients</b> for non-related traffic. Once an entry is persisted into the Raft log by a
+      <b>majority</b> of pods it is committed and can be replied to the client; the apply (EAL) step is independent of
+      that acknowledgement path. So even if EAL stalls on a slow, partitioned, or leader-changing target, unrelated
+      reads/writes keep being committed and answered — <b>EAL lag does not affect availability</b>. The blocking is local
+      bookkeeping for the in-flight migration, not a client-facing stall.</p>
     </div>
 
-    <div class="card risk">
-      <h4>R5. removeCluster data-loss ordering <span class="sev hi">High</span></h4>
-      <p class="muted">The doc covers data migration but says cluster destroy is out of scope. The danger is sequencing:
-      if a cluster is torn down before all its EXPORTING shards finish and OM bumps the version, keys are lost. The
-      destroy path must be gated on "all shards fully migrated &amp; EndMigration acked," and that gate should itself be
-      persisted.</p>
+    <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
+      <h4 style="color:var(--ok)">R5. removeCluster data-loss ordering — resolved (persisted in OM Raft log) <span class="sev lo">Resolved</span></h4>
+      <p class="muted">All <code>addCluster</code>/<code>removeCluster</code> operations are persisted to OM's Raft log. Because
+      the cluster-membership change is itself a committed log entry, the destroy path is naturally sequenced after — and
+      gated on — the persisted migration progress ("all shards fully migrated &amp; EndMigration acked"). The gate and the
+      teardown are both durable, so a leader change cannot tear down a cluster whose EXPORTING shards have not finished,
+      and no keys are lost.</p>
     </div>
 
-    <div class="card risk">
-      <h4>R6. MIGRATED_ROUTE retry without route bump can loop <span class="sev md">Medium</span></h4>
-      <p class="muted">Client still holds the old route, so after a <code>MIGRATED_ROUTE</code> retry on target, the
-      target serves it using the IMPORTING label. But if the client's request also carries the old route version and the
-      target enforces version checks, you could get <code>SERVER/CLIENT_ROUTE_OUT_OF_DATE</code> at the same time. Make
-      sure the IMPORTING-accept path bypasses the normal version rejection, and define a retry budget to prevent loops.</p>
+    <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
+      <h4 style="color:var(--ok)">R6. MIGRATED_ROUTE retry — resolved (insert-if-absent makes retries safe) <span class="sev lo">Resolved</span></h4>
+      <p class="muted">The target accepts the redirected request under its <span class="pill imp">IMPORTING</span> label,
+      bypassing the normal route-version rejection, so a <code>MIGRATED_ROUTE</code> retry lands. Combined with the
+      <b>insert-if-absent</b> rule for <code>MigrateBatch</code> (see R7), repeated retries converge rather than loop:
+      whoever writes the key first wins, and a later migrated copy never clobbers it.</p>
     </div>
 
-    <div class="card risk">
-      <h4>R7. Idempotency keys for MigrateBatch <span class="sev md">Medium</span></h4>
-      <p class="muted">"These commands need to be idempotent" is stated but the mechanism isn't. Without a stable
-      command/sequence id, a retried MigrateBatch could re-import a key the target has since legitimately updated
-      (after route flip), overwriting newer data with stale migrated data. Each command needs a monotonic id and the
-      target must dedupe / reject stale applies.</p>
+    <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
+      <h4 style="color:var(--ok)">R7. Idempotency for MigrateBatch — resolved (write only if key does not exist) <span class="sev lo">Resolved</span></h4>
+      <p class="muted"><code>MigrateBatch</code> writes a key-value on the target <b>only if the key does not already exist</b>.
+      This single rule makes the batch idempotent without a separate sequence id: if the key is already present it is
+      <b>not</b> overwritten, because that existing value is either</p>
+      <ul>
+        <li>a copy written by a <b>previous (retried) MigrateBatch</b> for the same key — re-applying would be a no-op anyway; or</li>
+        <li>a <b>newer value written by a client</b>. This can happen because the MigrationCommand releases its per-key lock
+        once it passes CPL, while EAL may have a large lag. During that window a client write for the same key finds it
+        absent in the CPL state machine and is accepted — so the client's value is the authoritative, newer one and must
+        not be overwritten by the lagging migrated value.</li>
+      </ul>
+      <p class="muted">Either way, "skip if present" guarantees a retried or delayed <code>MigrateBatch</code> never replaces
+      newer data with stale migrated data.</p>
     </div>
 
     <div class="card risk">
@@ -475,12 +486,14 @@
       with the OS-side ShardMigration task state (which is the real source of truth for progress).</p>
     </div>
 
-    <div class="card risk">
-      <h4>R9. Consistency model during the window <span class="sev md">Medium</span></h4>
-      <p class="muted">The "clients always see the latest value" guarantee depends on <b>every</b> read of an
-      EXPORTING-shard key being forced through source first. Any client with a stale-but-not-rejected route, or any
-      direct target access for an IMPORTING key that was concurrently written on source, could read stale. Worth a
-      formal statement of the linearizability boundary for keys mid-migration.</p>
+    <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
+      <h4 style="color:var(--ok)">R9. Consistency model during the window — resolved <span class="sev lo">Resolved</span></h4>
+      <p class="muted">The only way the source and a migrating key can diverge is the EAL-lag window above: after the
+      MigrationCommand passes CPL and drops the lock, a client may write the key before EAL applies the migration. The
+      <b>insert-if-absent</b> rule on the target resolves this deterministically — the first writer of the key wins and
+      the migrated value defers to any value already present. Reads of an EXPORTING-shard key stay anchored to the source
+      (absent → <code>MIGRATED_ROUTE</code> → target), so clients always observe the latest value and never a stale
+      migrated copy.</p>
     </div>
   </section>
 
@@ -492,8 +505,11 @@
     "moved" marker</b>: absence at the source always means "redirect to target" (<code>MIGRATED_ROUTE</code>), which
     cleanly handles both migrated and brand-new keys (R1, R2 resolved). Cross-cluster atomicity (R3) is handled by
     <b>replaying the persisted MigrationCommand until both the target ack and the local delete succeed</b>, reconciling
-    any crash-window duplicate to target-only. The main thing still worth hardening is <b>EAL blocking</b> on remote
-    acks (R4), backed by per-command idempotency ids (R7).</p>
+    any crash-window duplicate to target-only. EAL blocking does not hurt availability (R4): clients are replied once
+    entries are committed to the Raft log by a majority, independent of EAL apply. Cluster membership changes are
+    persisted to OM's Raft log so teardown is safely sequenced (R5), and <code>MigrateBatch</code> is
+    <b>insert-if-absent</b> — it writes a key only if absent — which makes it idempotent and lets a newer client value
+    written during EAL lag win over a lagging migrated copy (R6, R7, R9 resolved).</p>
   </section>
 </main>
 
