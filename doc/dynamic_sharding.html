@@ -479,11 +479,23 @@
       newer data with stale migrated data.</p>
     </div>
 
-    <div class="card risk">
-      <h4>R8. Single OM leader as migration driver <span class="sev lo">Low</span></h4>
-      <p class="muted">The task consumer runs "only in leader." On leader churn the new leader must re-derive in-flight
-      state from the log and avoid double-driving a shard that's mid-MigrateBatch. Verify the resume logic reconciles
-      with the OS-side ShardMigration task state (which is the real source of truth for progress).</p>
+    <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
+      <h4 style="color:var(--ok)">R8. Single OM leader as migration driver — resolved (idempotent task + OS-side rejection) <span class="sev lo">Resolved</span></h4>
+      <p class="muted">Leader churn is <b>not</b> a correctness problem on its own: a <code>ShardMigrationTask</code> may be
+      <b>triggered by leader A and have its <code>OnMigration</code> result received by leader B</b>, and the migration still
+      completes correctly because all task state lives in OM's Raft log rather than in the leader's memory. The one real
+      hazard is <b>double-driving</b> — two attempts (across a leader change) issuing the task for the same shard. This is
+      closed on both sides:</p>
+      <ul>
+        <li><b>Idempotent ShardMigrationTask:</b> the task carries a stable per-shard identity, so re-issuing it for a shard
+        already in flight is a no-op rather than a second, conflicting migration.</li>
+        <li><b>OS-side rejection:</b> the OS <b>rejects a <code>ShardMigrationTask</code> for a shard that already has an
+        active migration</b> (already labeled EXPORTING/IMPORTING with a live ShardMigration task). The OS-side task state
+        remains the source of truth for progress, so a new leader's re-drive reconciles against it instead of starting a
+        duplicate.</li>
+      </ul>
+      <p class="muted">Together these make driving the task at-least-once safe: whether the trigger and the result land on the
+      same leader or different leaders, exactly one migration runs per shard.</p>
     </div>
 
     <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
@@ -509,7 +521,10 @@
     entries are committed to the Raft log by a majority, independent of EAL apply. Cluster membership changes are
     persisted to OM's Raft log so teardown is safely sequenced (R5), and <code>MigrateBatch</code> is
     <b>insert-if-absent</b> — it writes a key only if absent — which makes it idempotent and lets a newer client value
-    written during EAL lag win over a lagging migrated copy (R6, R7, R9 resolved).</p>
+    written during EAL lag win over a lagging migrated copy (R6, R7, R9 resolved). Finally, leader churn on the OM
+    migration driver is safe (R8 resolved): a <code>ShardMigrationTask</code> can be triggered by one leader and completed
+    under another because all task state is in OM's Raft log, and double-driving is prevented by making the task
+    <b>idempotent</b> and having the <b>OS reject a second <code>ShardMigrationTask</code> for a shard already migrating</b>.</p>
   </section>
 </main>
 
