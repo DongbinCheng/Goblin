@@ -417,14 +417,23 @@
       a soon-to-be-emptied source.)</p>
     </div>
 
-    <div class="card risk">
-      <h4>R3. Atomicity spans two Raft groups <span class="sev hi">High</span></h4>
-      <p class="muted">"Export to target + delete local" is described as atomic, but it crosses two independent Raft
-      clusters. There is a window: target has committed the data, source crashes before committing the delete. On
-      recovery K exists in <b>both</b>. Reads still go to source (correct), but a subsequent target-side write (once route
-      flips) plus a leftover source copy can resurface as stale data if any later migration re-reads source. Ensure the
-      delete is driven by a persisted, replayable command and that target writes win deterministically. This is
-      effectively a 2-phase commit across clusters — call it out explicitly.</p>
+    <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
+      <h4 style="color:var(--ok)">R3. Cross-cluster atomicity — handled by persisted command replay <span class="sev lo">Resolved</span></h4>
+      <p class="muted">The MigrationCommand is persisted in the source's Raft log, so it is <b>replayed-until-complete</b>
+      rather than truly atomic. If the source crashes after the target commits but before the local delete, recovery
+      re-applies the same command: it re-sends <code>MigrateBatch</code> (idempotent on the target) and re-runs the local
+      delete. The command only retires once both the target ack and the local delete have succeeded, so the transient
+      "key in both places" state is always reconciled to <b>target-only</b>. During the whole window reads stay anchored
+      to the source, so clients never observe the duplicate.</p>
+      <p class="muted">Two invariants this relies on — keep them explicit in the implementation:</p>
+      <ul>
+        <li><b>Target idempotency:</b> a replayed <code>MigrateBatch</code> must not overwrite a value the target has
+        legitimately updated later. While the shard is IMPORTING and the route hasn't flipped, the target hasn't taken
+        independent writes yet, so a re-import is safe; pair with a per-command monotonic id (see R7) to be defensive
+        once labels/route change.</li>
+        <li><b>Delete is part of the same replayable command:</b> the local delete must be driven by the persisted
+        command (not a side effect), so a crash before the delete is always retried on recovery.</li>
+      </ul>
     </div>
 
     <div class="card risk">
@@ -481,8 +490,10 @@
     actually moves, and flips the route version only once a shard is fully migrated. Persisting every state change into
     Raft is what makes it resumable across leader changes. Following the Redis-style decision, there is <b>no per-key
     "moved" marker</b>: absence at the source always means "redirect to target" (<code>MIGRATED_ROUTE</code>), which
-    cleanly handles both migrated and brand-new keys (R1, R2 resolved). The main things still worth hardening are the
-    <b>cross-cluster atomicity</b> (R3) and <b>EAL blocking</b> on remote acks (R4).</p>
+    cleanly handles both migrated and brand-new keys (R1, R2 resolved). Cross-cluster atomicity (R3) is handled by
+    <b>replaying the persisted MigrationCommand until both the target ack and the local delete succeed</b>, reconciling
+    any crash-window duplicate to target-only. The main thing still worth hardening is <b>EAL blocking</b> on remote
+    acks (R4), backed by per-command idempotency ids (R7).</p>
   </section>
 </main>
 
