@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<!--
+Copyright 2021-2022 eBay Inc.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    https://www.apache.org/licenses/LICENSE-2.0
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Goblin Dynamic Sharding &mdash; Design &amp; Current Code Walkthrough</title>
+<style>
+  :root{
+    --bg:#0f1218; --panel:#161b22; --panel2:#1c232d; --ink:#e6edf3; --muted:#9aa7b4;
+    --line:#2d3742; --accent:#4f9cff; --green:#3fb950; --amber:#d29922; --red:#f85149;
+    --purple:#bc8cff; --teal:#39c5bb; --code:#0b0f14;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+  header{padding:32px 40px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#11161d,#0f1218);}
+  header h1{margin:0 0 6px;font-size:26px}
+  header p{margin:0;color:var(--muted)}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px 80px}
+  nav{position:sticky;top:0;background:rgba(15,18,24,.92);backdrop-filter:blur(6px);
+    border-bottom:1px solid var(--line);padding:10px 24px;z-index:50;font-size:13px}
+  nav a{color:var(--accent);text-decoration:none;margin-right:16px;white-space:nowrap}
+  nav a:hover{text-decoration:underline}
+  h2{margin:48px 0 8px;font-size:21px;border-left:4px solid var(--accent);padding-left:12px}
+  h3{margin:28px 0 6px;font-size:17px;color:#cdd9e5}
+  p{color:#cdd9e5}
+  .muted{color:var(--muted)}
+  code{background:var(--code);padding:1px 6px;border-radius:5px;color:#c9d1d9;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+    overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px;color:#c9d1d9}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 22px;margin:16px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:860px){.grid2{grid-template-columns:1fr}}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#cdd9e5}
+  td code{font-size:12px}
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;border:1px solid}
+  .ok{color:var(--green);border-color:var(--green);background:rgba(63,185,80,.08)}
+  .partial{color:var(--amber);border-color:var(--amber);background:rgba(210,153,34,.08)}
+  .todo{color:var(--red);border-color:var(--red);background:rgba(248,81,73,.08)}
+  .legend span{margin-right:18px;font-size:12.5px}
+  figure{margin:18px 0;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  figcaption{color:var(--muted);font-size:12.5px;margin-top:8px;text-align:center}
+  .cite{color:var(--purple);font-size:12px;font-family:ui-monospace,monospace}
+  svg{display:block;margin:0 auto;max-width:100%;height:auto}
+  .svgtext{fill:var(--ink);font:13px -apple-system,Segoe UI,Roboto,sans-serif}
+  .svgsmall{fill:var(--muted);font:11px ui-monospace,monospace}
+  .svglabel{fill:#0b0f14;font:12px -apple-system,Segoe UI,Roboto,sans-serif;font-weight:600}
+  ul li{margin:3px 0}
+  .callout{border-left:4px solid var(--teal);background:rgba(57,197,187,.06);padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0}
+  .warn{border-left-color:var(--amber);background:rgba(210,153,34,.06)}
+  .danger{border-left-color:var(--red);background:rgba(248,81,73,.06)}
+</style>
+</head>
+<body>
+<header>
+  <h1>Goblin Dynamic Sharding</h1>
+  <p>Design proposal &amp; a guided walkthrough of the migration code already present in the repository.</p>
+</header>
+
+<nav>
+  <a href="#tldr">TL;DR</a>
+  <a href="#arch">Architecture</a>
+  <a href="#static">Static sharding today</a>
+  <a href="#blocks">Migration building blocks</a>
+  <a href="#export">Export / Import</a>
+  <a href="#states">State machine</a>
+  <a href="#flow">End-to-end flow</a>
+  <a href="#avail">Availability</a>
+  <a href="#gaps">Gaps &amp; plan</a>
+</nav>
+
+<div class="wrap">
+
+<!-- ===================================================================== -->
+<h2 id="tldr">TL;DR</h2>
+<div class="panel">
+<p>Goblin splits the key space into <b>4096 fixed shards</b> (<code>hash(key) &amp; (2^12-1)</code>). The
+<b>Object Manager (OM)</b> is a Raft cluster that owns a <b>consistent-hash ring</b> mapping
+<i>shard&nbsp;&rarr;&nbsp;cluster</i> and publishes it as a versioned <code>RouteInfo</code>. Each
+<b>Object Store (OS)</b> is itself a Raft cluster that stores the data for the shards it owns.</p>
+<p><b>The scaffolding for dynamic sharding already exists</b> &mdash; an OM-side migration
+orchestrator (<code>ClusterProxy</code>/<code>ClusterClient</code>/<code>Migration</code>), an OS-side
+<code>MigrationManager</code> (scan &rarr; export &rarr; delete), <code>StartMigration</code>/<code>EndMigration</code>
+RPCs, migration-aware routing codes (<code>WRONG_ROUTE</code>, <code>MIGRATED_ROUTE</code>,
+<code>CLIENT/SERVER_ROUTE_OUT_OF_DATE</code>), and a Raft-persisted migration task state machine.
+But the pieces are <b>not wired together end-to-end</b>: the trigger that creates migration tasks is
+commented out, the import RPC is never registered, and failure / remove-cluster paths are stubs.</p>
+<p class="legend" style="margin-top:6px">
+  <span class="tag ok">IMPLEMENTED</span>
+  <span class="tag partial">PARTIAL / UNVERIFIED</span>
+  <span class="tag todo">STUB / MISSING</span>
+</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="arch">1. Component architecture</h2>
+<p>Two services, both built on Gringofts Raft. Clients always talk to OM first to learn the route,
+then read/write directly against the owning OS cluster.</p>
+
+<figure>
+<svg viewBox="0 0 1000 430" role="img" aria-label="Goblin component architecture">
+  <!-- client -->
+  <rect x="40" y="180" width="150" height="70" rx="10" fill="#1f6feb"/>
+  <text x="115" y="210" text-anchor="middle" class="svglabel">Client(s)</text>
+  <text x="115" y="230" text-anchor="middle" class="svgsmall" fill="#cfe2ff">cache RouteInfo</text>
+
+  <!-- OM -->
+  <rect x="380" y="30" width="240" height="150" rx="12" fill="#161b22" stroke="#bc8cff" stroke-width="1.5"/>
+  <text x="500" y="55" text-anchor="middle" class="svgtext" font-weight="700">Object Manager (OM)</text>
+  <text x="500" y="74" text-anchor="middle" class="svgsmall">Raft cluster &middot; control plane</text>
+  <rect x="400" y="86" width="200" height="26" rx="6" fill="#1c232d"/>
+  <text x="500" y="103" text-anchor="middle" class="svgsmall" fill="#bc8cff">HashRing (4096) &rarr; RouteInfo</text>
+  <rect x="400" y="116" width="200" height="26" rx="6" fill="#1c232d"/>
+  <text x="500" y="133" text-anchor="middle" class="svgsmall" fill="#bc8cff">ClusterSetManager / Migration</text>
+  <rect x="400" y="146" width="200" height="24" rx="6" fill="#1c232d"/>
+  <text x="500" y="162" text-anchor="middle" class="svgsmall" fill="#bc8cff">ClusterProxy &rarr; ClusterClient</text>
+
+  <!-- OS1 -->
+  <rect x="360" y="270" width="270" height="130" rx="12" fill="#161b22" stroke="#39c5bb" stroke-width="1.5"/>
+  <text x="495" y="294" text-anchor="middle" class="svgtext" font-weight="700">Object Store cluster A</text>
+  <text x="495" y="312" text-anchor="middle" class="svgsmall">Raft cluster &middot; data plane</text>
+  <rect x="378" y="322" width="234" height="26" rx="6" fill="#1c232d"/>
+  <text x="495" y="339" text-anchor="middle" class="svgsmall" fill="#39c5bb">KVEngine + RocksDB column families</text>
+  <rect x="378" y="352" width="234" height="26" rx="6" fill="#1c232d"/>
+  <text x="495" y="369" text-anchor="middle" class="svgsmall" fill="#39c5bb">MigrationManager (scan/export)</text>
+
+  <!-- OS2 -->
+  <rect x="700" y="270" width="270" height="130" rx="12" fill="#161b22" stroke="#39c5bb" stroke-width="1.5"/>
+  <text x="835" y="294" text-anchor="middle" class="svgtext" font-weight="700">Object Store cluster B</text>
+  <text x="835" y="312" text-anchor="middle" class="svgsmall">target of a migration</text>
+  <rect x="718" y="322" width="234" height="26" rx="6" fill="#1c232d"/>
+  <text x="835" y="339" text-anchor="middle" class="svgsmall" fill="#39c5bb">imports shards via MigrateBatch</text>
+
+  <!-- arrows -->
+  <defs>
+    <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/>
+    </marker>
+  </defs>
+  <line x1="190" y1="205" x2="375" y2="120" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="250" y="150" class="svgsmall">1. Router()</text>
+  <line x1="190" y1="220" x2="355" y2="320" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="235" y="300" class="svgsmall">2. Put/Get (direct)</text>
+  <line x1="500" y1="180" x2="497" y2="265" stroke="#bc8cff" stroke-width="1.6" marker-end="url(#arr)"/>
+  <text x="510" y="225" class="svgsmall" fill="#bc8cff">OnStartup / Start&amp;EndMigration</text>
+  <line x1="630" y1="345" x2="700" y2="345" stroke="#39c5bb" stroke-width="1.8" marker-end="url(#arr)"/>
+  <text x="612" y="392" class="svgsmall" fill="#39c5bb">MigrateBatch (A&rarr;B)</text>
+</svg>
+<figcaption>Control plane (OM, purple) publishes routing; data plane (OS, teal) serves keys and moves them during migration.</figcaption>
+</figure>
+
+<table>
+<tr><th>Concept</th><th>Where</th><th>Notes</th></tr>
+<tr><td>4096 shards, <code>hash &amp; (2^12-1)</code></td><td class="cite">object-store/ObjectStore.h:130-134; common.proto Shard.DEFAULT=12</td><td>Shard id is computed identically on client and server.</td></tr>
+<tr><td>Consistent-hash ring, ring length 4096</td><td class="cite">object-manager/route/HashRing.h:52, HashRing.cpp:38-45</td><td>OM-only; maps shard&rarr;cluster, with virtual nodes (<code>VIRTUAL_NODE_COUNT</code>).</td></tr>
+<tr><td>Versioned <code>RouteInfo</code> (partition + placement)</td><td class="cite">common.proto:79-83; control.proto Router</td><td><code>version</code> bumps whenever placement/partition changes.</td></tr>
+<tr><td>Shard &rarr; RocksDB column family (working set)</td><td class="cite">object-store/ObjectStore.h:78-84</td><td><code>wsId = shardId &amp; ((1&lt;&lt;factor)-1)</code>; many shards share one CF.</td></tr>
+</table>
+
+<!-- ===================================================================== -->
+<h2 id="static">2. How static sharding routes a request today <span class="tag ok">IMPLEMENTED</span></h2>
+<p>Every OS request runs through a pre-execute routing gate
+(<span class="cite">ObjectStore.cpp:109-191</span>) <i>before</i> the command reaches the KV engine.
+This gate is already migration-aware &mdash; it knows how to reject, redirect, or wait.</p>
+
+<figure>
+<svg viewBox="0 0 1000 560" role="img" aria-label="Routing decision flow">
+  <defs>
+    <marker id="a2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/></marker>
+  </defs>
+  <!-- start -->
+  <rect x="410" y="20" width="180" height="40" rx="20" fill="#1f6feb"/>
+  <text x="500" y="45" text-anchor="middle" class="svglabel">incoming Put/Get</text>
+
+  <!-- version check -->
+  <polygon points="500,80 650,135 500,190 350,135" fill="#1c232d" stroke="#4f9cff"/>
+  <text x="500" y="130" text-anchor="middle" class="svgsmall">client routeVersion</text>
+  <text x="500" y="146" text-anchor="middle" class="svgsmall">vs server?</text>
+
+  <rect x="700" y="78" width="270" height="38" rx="8" fill="#3b1f1f" stroke="#f85149"/>
+  <text x="835" y="102" text-anchor="middle" class="svgsmall" fill="#f6a9a4">client&gt;server &rarr; CLIENT_ROUTE_OUT_OF_DATE</text>
+  <rect x="700" y="150" width="270" height="38" rx="8" fill="#3a2f12" stroke="#d29922"/>
+  <text x="835" y="174" text-anchor="middle" class="svgsmall" fill="#e8c46a">client&lt;server &rarr; refresh + SERVER_OUT_OF_DATE</text>
+
+  <!-- ownership -->
+  <polygon points="500,210 660,270 500,330 340,270" fill="#1c232d" stroke="#4f9cff"/>
+  <text x="500" y="262" text-anchor="middle" class="svgsmall">shardId owned by</text>
+  <text x="500" y="278" text-anchor="middle" class="svgsmall">my cluster?</text>
+
+  <!-- not owned -->
+  <polygon points="190,210 320,260 190,310 60,260" fill="#1c232d" stroke="#4f9cff"/>
+  <text x="190" y="255" text-anchor="middle" class="svgsmall">status ==</text>
+  <text x="190" y="271" text-anchor="middle" class="svgsmall">IMPORTING &amp; mine?</text>
+  <rect x="60" y="335" width="260" height="36" rx="8" fill="#3b1f1f" stroke="#f85149"/>
+  <text x="190" y="358" text-anchor="middle" class="svgsmall" fill="#f6a9a4">else &rarr; WRONG_ROUTE</text>
+
+  <!-- owned -->
+  <polygon points="500,350 660,410 500,470 340,410" fill="#1c232d" stroke="#4f9cff"/>
+  <text x="500" y="402" text-anchor="middle" class="svgsmall">status == EXPORTING</text>
+  <text x="500" y="418" text-anchor="middle" class="svgsmall">&amp; key already moved?</text>
+
+  <rect x="700" y="392" width="270" height="38" rx="8" fill="#3a2f12" stroke="#d29922"/>
+  <text x="835" y="416" text-anchor="middle" class="svgsmall" fill="#e8c46a">yes &rarr; MIGRATED_ROUTE (routeHint=target)</text>
+
+  <rect x="395" y="500" width="210" height="40" rx="20" fill="#238636"/>
+  <text x="500" y="525" text-anchor="middle" class="svglabel">serve locally (OK)</text>
+
+  <!-- arrows -->
+  <line x1="500" y1="60" x2="500" y2="78" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <line x1="650" y1="120" x2="700" y2="100" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <line x1="640" y1="150" x2="700" y2="165" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <line x1="500" y1="190" x2="500" y2="210" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <text x="514" y="205" class="svgsmall">equal</text>
+  <line x1="340" y1="270" x2="322" y2="262" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <text x="300" y="225" class="svgsmall">no</text>
+  <line x1="190" y1="310" x2="190" y2="335" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <line x1="500" y1="330" x2="500" y2="350" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <text x="514" y="346" class="svgsmall">yes</text>
+  <line x1="660" y1="410" x2="700" y2="410" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <line x1="500" y1="470" x2="500" y2="500" stroke="#9aa7b4" marker-end="url(#a2)"/>
+  <text x="514" y="492" class="svgsmall">no</text>
+</svg>
+<figcaption>OS pre-execute routing gate (<span class="cite">ObjectStore.cpp:109-191</span>). The four red/amber exits are the
+migration-aware response codes defined in <span class="cite">common.proto:5-34</span>.</figcaption>
+</figure>
+
+<div class="callout">
+<b>Key insight:</b> the route is a <i>version handshake</i>. Client and server each carry a
+<code>routeVersion</code>; mismatch is resolved by the client refreshing from OM and retrying. This same
+versioning is what makes a live route change (i.e. dynamic sharding) safe.
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="blocks">3. Migration building blocks that already exist</h2>
+
+<div class="grid2">
+<div class="panel">
+<h3>OM side (orchestration)</h3>
+<ul>
+<li><code>HashRing::addClusterId(id, &amp;map)</code> computes exactly which shard ranges a <i>new</i>
+cluster steals from existing ones. <span class="tag ok">IMPLEMENTED</span><br><span class="cite">HashRing.cpp:66-102</span></li>
+<li><code>Migration</code> module: a Raft-persisted task with status transitions written inside a
+transaction. <span class="tag ok">IMPLEMENTED</span><br><span class="cite">module/Migration.cpp:31-54</span></li>
+<li><code>ClusterSetManager::beginMigration / endMigration</code> &rarr; <code>notifyStart/EndMigration</code>.
+<span class="tag ok">IMPLEMENTED</span><br><span class="cite">ClusterSetManager.cpp:302-326</span></li>
+<li><code>ClusterProxy</code> + <code>ClusterClient</code>: leader-aware gRPC client that calls
+<code>StartMigration</code>/<code>EndMigration</code> on an OS cluster with retry/redirect.
+<span class="tag ok">IMPLEMENTED</span><br><span class="cite">migration/ClusterClient.cpp:82-155</span></li>
+<li><code>handleMigrationSuccess</code>: flips both clusters to <code>IN_SERVICE</code>, marks task
+<code>SUCCEEDED</code>, bumps route version. <span class="tag ok">IMPLEMENTED</span><br><span class="cite">ClusterSetManager.cpp:265-291</span></li>
+</ul>
+</div>
+<div class="panel">
+<h3>OS side (data movement)</h3>
+<ul>
+<li><code>StartMigration/EndMigration</code> RPC handlers &rarr; <code>triggerMigration / finishMigration</code>
+(with leader check). <span class="tag ok">IMPLEMENTED</span><br><span class="cite">network/rpc/StartMigrationCallData.cpp; ObjectStore.cpp:208-272</span></li>
+<li><code>MigrationManager</code>: per-working-set <code>ScanTask</code> &rarr; <code>ExportTask</code>
+(export batch + delete local), 10-thread pool, progress reporting. <span class="tag ok">IMPLEMENTED</span><br><span class="cite">migration/MigrationManager.cpp</span></li>
+<li><code>migrateBatchAsync</code> &rarr; <code>importAsync</code> &rarr; <code>KVImportCommand</code> on the
+target preserves <code>version</code>/<code>ttl</code>. <span class="tag partial">PRESENT, NOT REGISTERED</span><br><span class="cite">kv-engine/KVEngineImpl.cpp</span></li>
+<li>Migration-aware routing codes &amp; <code>routeHint</code> redirect. <span class="tag ok">IMPLEMENTED</span><br><span class="cite">ObjectStore.cpp:159-184</span></li>
+</ul>
+</div>
+</div>
+
+<h3>How the ring decides what moves <span class="tag ok">IMPLEMENTED</span></h3>
+<p>When cluster <code>C_new</code> is hashed onto the ring, it lands between two existing points. Only the
+arc immediately <i>clockwise</i> of its position changes ownership &mdash; this is classic consistent
+hashing, so adding one cluster moves roughly <code>1/N</code> of the shards, not the whole space.</p>
+
+<figure>
+<svg viewBox="0 0 1000 320" role="img" aria-label="Consistent hash ring rebalance">
+  <!-- ring before -->
+  <circle cx="230" cy="160" r="110" fill="none" stroke="#2d3742" stroke-width="22"/>
+  <text x="230" y="40" text-anchor="middle" class="svgtext" font-weight="700">Before</text>
+  <!-- arcs A/B -->
+  <path d="M230,50 A110,110 0 0 1 340,160" fill="none" stroke="#39c5bb" stroke-width="22"/>
+  <path d="M340,160 A110,110 0 0 1 120,160" fill="none" stroke="#4f9cff" stroke-width="22"/>
+  <path d="M120,160 A110,110 0 0 1 230,50" fill="none" stroke="#39c5bb" stroke-width="22"/>
+  <text x="300" y="105" class="svgsmall" fill="#39c5bb">A</text>
+  <text x="150" y="225" class="svgsmall" fill="#4f9cff">B</text>
+  <text x="150" y="105" class="svgsmall" fill="#39c5bb">A</text>
+
+  <!-- ring after -->
+  <circle cx="720" cy="160" r="110" fill="none" stroke="#2d3742" stroke-width="22"/>
+  <text x="720" y="40" text-anchor="middle" class="svgtext" font-weight="700">After adding C</text>
+  <path d="M720,50 A110,110 0 0 1 830,160" fill="none" stroke="#39c5bb" stroke-width="22"/>
+  <path d="M830,160 A110,110 0 0 1 610,160" fill="none" stroke="#4f9cff" stroke-width="22"/>
+  <path d="M610,160 A110,110 0 0 1 690,68" fill="none" stroke="#39c5bb" stroke-width="22"/>
+  <!-- C steals an arc -->
+  <path d="M690,68 A110,110 0 0 1 720,50" fill="none" stroke="#bc8cff" stroke-width="22"/>
+  <text x="800" y="105" class="svgsmall" fill="#39c5bb">A</text>
+  <text x="640" y="225" class="svgsmall" fill="#4f9cff">B</text>
+  <text x="675" y="92" class="svgsmall" fill="#bc8cff">C</text>
+
+  <defs><marker id="a3" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/></marker></defs>
+  <line x1="350" y1="160" x2="600" y2="160" stroke="#9aa7b4" stroke-width="1.6" marker-end="url(#a3)"/>
+  <text x="475" y="150" text-anchor="middle" class="svgsmall">add C</text>
+  <text x="475" y="190" text-anchor="middle" class="svgsmall" fill="#bc8cff">only the purple arc migrates (A &rarr; C)</text>
+</svg>
+<figcaption>The shard range the new cluster steals is computed by walking the ring from the new node to the
+next node and collecting <code>[shard, next)</code> ids (<span class="cite">HashRing.cpp:90-99</span>). Those ids become the migration task's <code>migrateShards</code>.</figcaption>
+</figure>
+
+<!-- ===================================================================== -->
+<h2 id="export">4. Export &amp; import: moving the data <span class="tag partial">MECHANISM PRESENT</span></h2>
+<p>A shard is not a physical partition; it is logically grouped into a RocksDB column family
+(&ldquo;working set&rdquo;) via <code>wsId = shardId &amp; ((1&lt;&lt;factor)-1)</code>
+(<span class="cite">ObjectStore.h:78-84</span>). Migration scans the working set, filters by the shard ids
+being moved, ships them to the target, then deletes locally.</p>
+
+<figure>
+<svg viewBox="0 0 1000 360" role="img" aria-label="Export/import pipeline">
+  <defs><marker id="a4" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/></marker></defs>
+  <text x="220" y="28" text-anchor="middle" class="svgtext" font-weight="700">Source cluster (EXPORTING)</text>
+  <text x="800" y="28" text-anchor="middle" class="svgtext" font-weight="700">Target cluster (IMPORTING)</text>
+
+  <rect x="70" y="50" width="300" height="40" rx="8" fill="#1c232d" stroke="#39c5bb"/>
+  <text x="220" y="75" text-anchor="middle" class="svgsmall">ScanTask: scan working-set CF in batches of 100</text>
+  <rect x="70" y="110" width="300" height="40" rx="8" fill="#1c232d" stroke="#39c5bb"/>
+  <text x="220" y="135" text-anchor="middle" class="svgsmall">ExportTask.exportLocalKeys() &rarr; MigrateBatch</text>
+  <rect x="70" y="170" width="300" height="40" rx="8" fill="#1c232d" stroke="#39c5bb"/>
+  <text x="220" y="195" text-anchor="middle" class="svgsmall">ExportTask.deleteLocalKeys() (removeEntry)</text>
+  <rect x="70" y="230" width="300" height="40" rx="8" fill="#1c232d" stroke="#39c5bb"/>
+  <text x="220" y="255" text-anchor="middle" class="svgsmall">markExportTaskDone &rarr; progress report</text>
+
+  <rect x="640" y="110" width="320" height="40" rx="8" fill="#1c232d" stroke="#bc8cff"/>
+  <text x="800" y="135" text-anchor="middle" class="svgsmall">migrateBatchAsync &rarr; importAsync (per entry)</text>
+  <rect x="640" y="170" width="320" height="40" rx="8" fill="#1c232d" stroke="#bc8cff"/>
+  <text x="800" y="195" text-anchor="middle" class="svgsmall">KVImportCommand: keep version &amp; ttl, write CF</text>
+
+  <line x1="370" y1="130" x2="640" y2="130" stroke="#9aa7b4" stroke-width="1.8" marker-end="url(#a4)"/>
+  <text x="505" y="120" text-anchor="middle" class="svgsmall">MigrateBatch RPC</text>
+  <line x1="640" y1="195" x2="372" y2="190" stroke="#9aa7b4" stroke-width="1.4" marker-end="url(#a4)" stroke-dasharray="5 4"/>
+  <text x="505" y="225" text-anchor="middle" class="svgsmall">results (retry until all OK)</text>
+
+  <line x1="220" y1="90" x2="220" y2="110" stroke="#9aa7b4" marker-end="url(#a4)"/>
+  <line x1="220" y1="150" x2="220" y2="170" stroke="#9aa7b4" marker-end="url(#a4)"/>
+  <line x1="220" y1="210" x2="220" y2="230" stroke="#9aa7b4" marker-end="url(#a4)"/>
+</svg>
+<figcaption>Export pipeline (<span class="cite">MigrationManager.cpp:36-162</span>) and import path
+(<span class="cite">KVEngineImpl::migrateBatchAsync / KVImportCommand</span>). Versions and TTLs are carried so
+the target reproduces the exact state.</figcaption>
+</figure>
+
+<div class="callout warn">
+<b>Important gap:</b> on the target, <code>migrateBatchAsync</code> exists but there is <b>no
+<code>MigrateBatchCallData</code></b> registered in <span class="cite">RequestReceiver.cpp:76-84</span>
+(only Connect/Get/Put/Delete/Trans/Generate/StartMigration/EndMigration/Watch are spawned). So a
+<code>MigrateBatch</code> RPC has no server handler today &mdash; the import side is effectively dead until
+this is wired up.
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="states">5. Migration state machine</h2>
+<p>The task lives in two coupled state machines: the <b>migration task status</b> (persisted in OM Raft)
+and each <b>cluster's status</b> (<code>IN_SERVICE</code> &harr; <code>EXPORTING/IMPORTING</code>).</p>
+
+<figure>
+<svg viewBox="0 0 1000 300" role="img" aria-label="Migration state machine">
+  <defs><marker id="a5" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/></marker></defs>
+  <!-- task states -->
+  <g>
+    <rect x="40" y="120" width="130" height="50" rx="10" fill="#1c232d" stroke="#4f9cff"/>
+    <text x="105" y="150" text-anchor="middle" class="svgsmall">NOT_START</text>
+    <rect x="230" y="120" width="130" height="50" rx="10" fill="#3a2f12" stroke="#d29922"/>
+    <text x="295" y="143" text-anchor="middle" class="svgsmall" fill="#e8c46a">PREPARED</text>
+    <text x="295" y="159" text-anchor="middle" class="svgsmall" fill="#d29922">(unused)</text>
+    <rect x="420" y="120" width="130" height="50" rx="10" fill="#3a2f12" stroke="#d29922"/>
+    <text x="485" y="143" text-anchor="middle" class="svgsmall" fill="#e8c46a">RUNNING</text>
+    <text x="485" y="159" text-anchor="middle" class="svgsmall" fill="#d29922">(report only)</text>
+    <rect x="610" y="60" width="130" height="50" rx="10" fill="#12331c" stroke="#3fb950"/>
+    <text x="675" y="90" text-anchor="middle" class="svgsmall" fill="#7ee787">SUCCEEDED</text>
+    <rect x="610" y="180" width="130" height="50" rx="10" fill="#3b1f1f" stroke="#f85149"/>
+    <text x="675" y="203" text-anchor="middle" class="svgsmall" fill="#f6a9a4">FAILED</text>
+    <text x="675" y="219" text-anchor="middle" class="svgsmall" fill="#f85149">(not handled)</text>
+  </g>
+  <line x1="170" y1="145" x2="230" y2="145" stroke="#9aa7b4" marker-end="url(#a5)"/>
+  <line x1="360" y1="145" x2="420" y2="145" stroke="#9aa7b4" marker-end="url(#a5)"/>
+  <line x1="550" y1="135" x2="610" y2="95" stroke="#9aa7b4" marker-end="url(#a5)"/>
+  <line x1="550" y1="155" x2="610" y2="195" stroke="#9aa7b4" stroke-dasharray="5 4" marker-end="url(#a5)"/>
+
+  <rect x="790" y="60" width="180" height="170" rx="10" fill="#161b22" stroke="#2d3742"/>
+  <text x="880" y="84" text-anchor="middle" class="svgsmall">Cluster status</text>
+  <text x="880" y="110" text-anchor="middle" class="svgsmall" fill="#7ee787">IN_SERVICE</text>
+  <text x="880" y="134" text-anchor="middle" class="svgsmall">&darr; start</text>
+  <text x="880" y="158" text-anchor="middle" class="svgsmall" fill="#e8c46a">EXPORTING / IMPORTING</text>
+  <text x="880" y="182" text-anchor="middle" class="svgsmall">&darr; end</text>
+  <text x="880" y="206" text-anchor="middle" class="svgsmall" fill="#7ee787">IN_SERVICE</text>
+</svg>
+<figcaption>Today only <code>NOT_START</code> and <code>SUCCEEDED</code> are written
+(<span class="cite">ClusterSetManager.cpp:279; Migration.cpp:31-39</span>). <code>PREPARED</code> is never
+set, <code>RUNNING</code> only appears in progress reports, and <code>FAILED</code> handling is a stub
+(<span class="cite">OnMigrationCallData failure branch</span>).</figcaption>
+</figure>
+
+<!-- ===================================================================== -->
+<h2 id="flow">6. Proposed end-to-end dynamic-sharding flow</h2>
+<p>This is the target sequence once the gaps are closed. Steps that already work are marked
+<span class="tag ok">OK</span>; steps that need code are flagged.</p>
+
+<figure>
+<svg viewBox="0 0 1000 620" role="img" aria-label="End to end sequence">
+  <!-- lifelines -->
+  <defs><marker id="a6" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/></marker></defs>
+  <g class="svgsmall">
+    <rect x="60" y="20" width="120" height="34" rx="8" fill="#1f6feb"/><text x="120" y="42" text-anchor="middle" class="svglabel">Admin/OM</text>
+    <rect x="300" y="20" width="120" height="34" rx="8" fill="#161b22" stroke="#bc8cff"/><text x="360" y="42" text-anchor="middle" class="svgtext">OM state</text>
+    <rect x="540" y="20" width="120" height="34" rx="8" fill="#161b22" stroke="#39c5bb"/><text x="600" y="42" text-anchor="middle" class="svgtext">Source OS</text>
+    <rect x="780" y="20" width="160" height="34" rx="8" fill="#161b22" stroke="#39c5bb"/><text x="860" y="42" text-anchor="middle" class="svgtext">Target OS / Client</text>
+  </g>
+  <line x1="120" y1="54" x2="120" y2="600" stroke="#2d3742"/>
+  <line x1="360" y1="54" x2="360" y2="600" stroke="#2d3742"/>
+  <line x1="600" y1="54" x2="600" y2="600" stroke="#2d3742"/>
+  <line x1="860" y1="54" x2="860" y2="600" stroke="#2d3742"/>
+
+  <g class="svgsmall">
+    <line x1="120" y1="90" x2="360" y2="90" stroke="#9aa7b4" marker-end="url(#a6)"/>
+    <text x="240" y="82" text-anchor="middle">1. AddCluster / onboardCluster</text>
+    <text x="240" y="104" text-anchor="middle" class="todo" fill="#f85149">(rebalance block commented out)</text>
+
+    <line x1="360" y1="140" x2="360" y2="140" stroke="#9aa7b4"/>
+    <rect x="300" y="128" width="120" height="26" rx="6" fill="#1c232d" stroke="#bc8cff"/>
+    <text x="360" y="145" text-anchor="middle">HashRing diff &rarr; shards</text>
+
+    <line x1="360" y1="180" x2="360" y2="180" stroke="#9aa7b4"/>
+    <rect x="288" y="168" width="144" height="26" rx="6" fill="#12331c" stroke="#3fb950"/>
+    <text x="360" y="185" text-anchor="middle">create Migration (NOT_START, Raft)</text>
+
+    <line x1="360" y1="225" x2="600" y2="225" stroke="#9aa7b4" marker-end="url(#a6)"/>
+    <text x="480" y="217" text-anchor="middle">2. StartMigration (src EXPORTING)</text>
+    <line x1="360" y1="250" x2="860" y2="250" stroke="#9aa7b4" marker-end="url(#a6)"/>
+    <text x="610" y="242" text-anchor="middle">2b. StartMigration (target IMPORTING)</text>
+
+    <line x1="600" y1="295" x2="860" y2="295" stroke="#39c5bb" stroke-width="1.6" marker-end="url(#a6)"/>
+    <text x="730" y="287" text-anchor="middle" fill="#7fd4cd">3. MigrateBatch (scan/export)</text>
+    <line x1="860" y1="320" x2="602" y2="320" stroke="#39c5bb" stroke-dasharray="4 4" marker-end="url(#a6)"/>
+    <text x="730" y="338" text-anchor="middle" class="todo" fill="#f85149">needs MigrateBatchCallData</text>
+
+    <line x1="600" y1="370" x2="360" y2="370" stroke="#9aa7b4" marker-end="url(#a6)"/>
+    <text x="480" y="362" text-anchor="middle">4. OnMigration progress (RUNNING&hellip;SUCCEEDED)</text>
+
+    <line x1="360" y1="415" x2="360" y2="415" stroke="#9aa7b4"/>
+    <rect x="280" y="403" width="160" height="26" rx="6" fill="#12331c" stroke="#3fb950"/>
+    <text x="360" y="420" text-anchor="middle">both IN_SERVICE, task SUCCEEDED, ver++</text>
+
+    <line x1="360" y1="460" x2="600" y2="460" stroke="#9aa7b4" marker-end="url(#a6)"/>
+    <text x="480" y="452" text-anchor="middle">5. EndMigration (new RouteInfo)</text>
+    <line x1="360" y1="485" x2="860" y2="485" stroke="#9aa7b4" marker-end="url(#a6)"/>
+    <text x="610" y="477" text-anchor="middle">5b. EndMigration (new RouteInfo)</text>
+
+    <line x1="860" y1="535" x2="360" y2="535" stroke="#9aa7b4" stroke-dasharray="4 4" marker-end="url(#a6)"/>
+    <text x="610" y="527" text-anchor="middle">6. Client sees version bump &rarr; Router() refresh</text>
+    <line x1="360" y1="565" x2="860" y2="565" stroke="#9aa7b4" marker-end="url(#a6)"/>
+    <text x="610" y="557" text-anchor="middle">6b. new RouteInfo &rarr; client hits target for moved shards</text>
+  </g>
+</svg>
+<figcaption>Target sequence. The orchestration RPCs (2,4,5) and the export pipeline (3, source side) are
+implemented; the trigger (1), the import handler (3, target side), failure recovery (4), and removal are
+the work items.</figcaption>
+</figure>
+
+<!-- ===================================================================== -->
+<h2 id="avail">7. Why availability is preserved during a move</h2>
+<p>Dynamic sharding is only useful if the cluster keeps serving while data moves. Goblin's design relies
+on four already-present mechanisms working together:</p>
+<table>
+<tr><th>Window</th><th>Mechanism</th><th>Client experience</th><th>Code</th></tr>
+<tr><td>Before route flip</td><td>Source still owns the shard; serves normally while exporting.</td>
+<td>Normal reads/writes.</td><td class="cite">ObjectStore.cpp:159-191</td></tr>
+<tr><td>Key already exported &amp; deleted on source</td><td>Source returns <code>MIGRATED_ROUTE</code> with
+<code>routeHint</code> to target.</td><td>Transparent redirect &amp; retry.</td><td class="cite">ObjectStore.cpp:178-183</td></tr>
+<tr><td>Route changed but client stale</td><td>Version handshake: <code>WRONG_ROUTE</code> /
+<code>CLIENT_ROUTE_OUT_OF_DATE</code> &rarr; client refreshes from OM.</td><td>One refresh + retry.</td><td class="cite">ObjectStore.cpp:120-171</td></tr>
+<tr><td>Target receiving shard</td><td>Target in <code>IMPORTING</code> accepts keys for shards it is
+about to own.</td><td>Writes land on target.</td><td class="cite">ObjectStore.cpp:161-166</td></tr>
+</table>
+<div class="callout">
+Because each moved key carries its original <b>version</b>, the strong-consistency / CAS guarantees survive
+the move: a client that read version <code>v</code> on the source can still CAS against <code>v</code> on the
+target. (<span class="cite">KVImportCommand</span> preserves version &amp; ttl.)
+</div>
+<div class="callout danger">
+<b>Consistency caveat to design carefully:</b> the export &ldquo;copy then delete&rdquo; is <i>not</i> atomic
+across two Raft groups. A write that arrives on the source <i>after</i> its key was exported but
+<i>before</i> the route flips must not be silently lost. The redirect path
+(<code>MIGRATED_ROUTE</code> on <code>readMeta</code> not-found) is the intended guard, but it currently only
+triggers on read-meta miss &mdash; a per-shard &ldquo;sealed&rdquo; / freeze marker would make this airtight.
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="gaps">8. Implementation gaps &amp; suggested plan</h2>
+<table>
+<tr><th>#</th><th>Gap</th><th>Status</th><th>Location</th></tr>
+<tr><td>1</td><td>Migration-task creation on cluster add is commented out (only static sharding).</td>
+<td><span class="tag todo">STUB</span></td><td class="cite">ClusterSetManager.cpp:412-433 (onboardCluster)</td></tr>
+<tr><td>2</td><td><code>MigrateBatch</code> has no server-side <code>CallData</code> &rarr; import RPC never served.</td>
+<td><span class="tag todo">MISSING</span></td><td class="cite">RequestReceiver.cpp:76-84 (no MigrateBatchCallData)</td></tr>
+<tr><td>3</td><td><code>OnStartup.needMigration</code> is forced to <code>false</code>; <code>beginMigration</code> never fires.</td>
+<td><span class="tag todo">STUB</span></td><td class="cite">ClusterSetManager startCluster / OnStartupCallData</td></tr>
+<tr><td>4</td><td>Migration <b>failure</b> path unimplemented (no rollback / resume).</td>
+<td><span class="tag todo">STUB</span></td><td class="cite">OnMigrationCallData failure branch</td></tr>
+<tr><td>5</td><td><code>RemoveCluster</code> / scale-in does nothing.</td>
+<td><span class="tag todo">STUB</span></td><td class="cite">ClusterSetManager::removeCluster ~:298</td></tr>
+<tr><td>6</td><td><code>PREPARED</code>/<code>RUNNING</code> task states never persisted; coarse observability.</td>
+<td><span class="tag partial">PARTIAL</span></td><td class="cite">Migration.cpp; common.proto:86-92</td></tr>
+<tr><td>7</td><td>Export retry loops forever; several <code>assert()</code> on size mismatch / missing shard.</td>
+<td><span class="tag partial">FRAGILE</span></td><td class="cite">MigrationManager.cpp:105-126,144,204,211</td></tr>
+<tr><td>8</td><td>Atomic seal/freeze of a shard during the copy&rarr;delete&rarr;flip window.</td>
+<td><span class="tag todo">DESIGN</span></td><td class="cite">ObjectStore.cpp:172-184 (redirect only on readMeta miss)</td></tr>
+<tr><td>9</td><td>Leadership check uses a dummy <code>Get</code> instead of a dedicated command.</td>
+<td><span class="tag partial">HACK</span></td><td class="cite">ObjectStore.cpp:217,250</td></tr>
+</table>
+
+<div class="panel">
+<h3>Suggested incremental delivery order</h3>
+<ol>
+<li><b>Wire the import side</b> (gap&nbsp;2): add <code>MigrateBatchCallData</code>, register it in
+<code>RequestReceiver</code>, route to <code>migrateBatchAsync</code>. Without this nothing can be imported.</li>
+<li><b>Re-enable the trigger</b> (gaps&nbsp;1,3): uncomment / rebuild <code>onboardCluster</code>'s rebalance
+loop so adding a cluster produces a <code>NOT_START</code> migration task and sets
+<code>EXPORTING/IMPORTING</code>.</li>
+<li><b>Close the consistency window</b> (gap&nbsp;8): introduce a per-shard sealed marker on the source so
+post-export writes to a moved shard return <code>MIGRATED_ROUTE</code> deterministically (not only on
+read-meta miss).</li>
+<li><b>Robust progress + failure</b> (gaps&nbsp;4,6,7): persist <code>RUNNING</code>/<code>FAILED</code>,
+bound the retry, add resume-from-progress, replace asserts with recoverable errors.</li>
+<li><b>Scale-in</b> (gap&nbsp;5): implement <code>RemoveCluster</code> as the reverse migration (drain shards
+to remaining clusters using <code>HashRing::deleteClusterId</code>).</li>
+<li><b>Leadership primitive</b> (gap&nbsp;9): replace dummy-get checks with a dedicated lightweight command.</li>
+</ol>
+</div>
+
+<div class="callout" style="margin-top:24px">
+<b>Bottom line:</b> Goblin already contains a coherent dynamic-sharding skeleton &mdash; consistent-hash
+rebalancing, a Raft-persisted migration task, leader-aware orchestration RPCs, a scan/export/delete
+pipeline, and migration-aware routing codes. The remaining work is mostly <i>connecting</i> these pieces
+(import handler + re-enabling the trigger) and <i>hardening</i> the edges (atomic shard seal, failure
+recovery, scale-in) rather than designing from scratch.
+</div>
+
+<p class="muted" style="margin-top:40px;font-size:12px">Generated walkthrough based on the current
+<code>server/src/object-manager</code> and <code>server/src/object-store</code> sources. All citations refer to
+files in this repository at the time of writing.</p>
+
+</div>
+</body>
+</html>

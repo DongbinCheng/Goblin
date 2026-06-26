@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<!--
+Copyright 2021-2022 eBay Inc.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    https://www.apache.org/licenses/LICENSE-2.0
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Goblin Dynamic Sharding &mdash; Client-Side Logic Design</title>
+<style>
+  :root{
+    --bg:#0f1218; --panel:#161b22; --panel2:#1c232d; --ink:#e6edf3; --muted:#9aa7b4;
+    --line:#2d3742; --accent:#4f9cff; --green:#3fb950; --amber:#d29922; --red:#f85149;
+    --purple:#bc8cff; --teal:#39c5bb; --code:#0b0f14;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+  header{padding:32px 40px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#11161d,#0f1218);}
+  header h1{margin:0 0 6px;font-size:26px}
+  header p{margin:0;color:var(--muted)}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px 80px}
+  nav{position:sticky;top:0;background:rgba(15,18,24,.92);backdrop-filter:blur(6px);
+    border-bottom:1px solid var(--line);padding:10px 24px;z-index:50;font-size:13px}
+  nav a{color:var(--accent);text-decoration:none;margin-right:16px;white-space:nowrap}
+  nav a:hover{text-decoration:underline}
+  h2{margin:48px 0 8px;font-size:21px;border-left:4px solid var(--accent);padding-left:12px}
+  h3{margin:28px 0 6px;font-size:17px;color:#cdd9e5}
+  p{color:#cdd9e5}
+  .muted{color:var(--muted)}
+  code{background:var(--code);padding:1px 6px;border-radius:5px;color:#c9d1d9;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+    overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px;color:#c9d1d9}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 22px;margin:16px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:860px){.grid2{grid-template-columns:1fr}}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#cdd9e5}
+  td code{font-size:12px}
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;border:1px solid}
+  .ok{color:var(--green);border-color:var(--green);background:rgba(63,185,80,.08)}
+  .partial{color:var(--amber);border-color:var(--amber);background:rgba(210,153,34,.08)}
+  .todo{color:var(--red);border-color:var(--red);background:rgba(248,81,73,.08)}
+  .legend span{margin-right:18px;font-size:12.5px}
+  figure{margin:18px 0;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  figcaption{color:var(--muted);font-size:12.5px;margin-top:8px;text-align:center}
+  .cite{color:var(--purple);font-size:12px;font-family:ui-monospace,monospace}
+  svg{display:block;margin:0 auto;max-width:100%;height:auto}
+  .svgtext{fill:var(--ink);font:13px -apple-system,Segoe UI,Roboto,sans-serif}
+  .svgsmall{fill:var(--muted);font:11px ui-monospace,monospace}
+  .svglabel{fill:#0b0f14;font:12px -apple-system,Segoe UI,Roboto,sans-serif;font-weight:600}
+  ul li{margin:3px 0}
+  .callout{border-left:4px solid var(--teal);background:rgba(57,197,187,.06);padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0}
+  .warn{border-left-color:var(--amber);background:rgba(210,153,34,.06)}
+  .danger{border-left-color:var(--red);background:rgba(248,81,73,.06)}
+  .ok2{border-left-color:var(--green);background:rgba(63,185,80,.06)}
+  .step{display:inline-block;width:22px;height:22px;border-radius:50%;background:var(--accent);
+    color:#06101f;font-weight:700;text-align:center;line-height:22px;font-size:12px;margin-right:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Goblin Dynamic Sharding &mdash; Client-Side Logic Design</h1>
+  <p>How the Goblin client routes keys correctly during an online shard migration, driven entirely by the Object&nbsp;Store's response codes. The companion to the server-side <em>v2 Target Design</em>.</p>
+</header>
+
+<nav>
+  <a href="#tldr">TL;DR</a>
+  <a href="#problem">The one-RouteInfo problem</a>
+  <a href="#contract">Response-code contract</a>
+  <a href="#state">Client state</a>
+  <a href="#route">Routing decision</a>
+  <a href="#loop">Retry loop</a>
+  <a href="#ask">ASK redirect</a>
+  <a href="#moved">MOVED refresh</a>
+  <a href="#edge">Edge cases</a>
+  <a href="#gaps">Code gaps</a>
+  <a href="#plan">Work plan</a>
+</nav>
+
+<div class="wrap">
+
+<!-- ===================================================================== -->
+<h2 id="tldr">TL;DR</h2>
+<div class="panel">
+<p>
+A Goblin client caches exactly <strong>one versioned <code>RouteInfo</code></strong> (shard&rarr;cluster map +
+<code>routeVersion</code>) and stamps that version on every request. The server's <code>preExecute</code>
+compares the stamped version against its own and, together with per-shard migration state, replies with one of
+four <strong>route response codes</strong>. The client never tries to <em>predict</em> migration; it reacts to
+those codes. This document specifies that reaction for each code so that reads and writes stay correct while a
+shard moves from a <em>source</em> cluster to a <em>target</em> cluster.</p>
+
+<p>The two redirect primitives mirror Redis&nbsp;Cluster, exactly matching the server design:</p>
+<ul>
+  <li><span class="tag ok">ASK</span> <code>MIGRATED_ROUTE (451)</code> &mdash; <strong>per-key, transient.</strong>
+      "This one key already moved; ask the target this once." The cached route is <em>not</em> changed.</li>
+  <li><span class="tag ok">MOVED</span> <code>CLIENT_ROUTE_OUT_OF_DATE (452)</code> &mdash; <strong>stable.</strong>
+      "Your map is stale; refresh <code>RouteInfo</code> from the OM and retry." The shard's owner has flipped.</li>
+</ul>
+
+<p class="muted">Legend used below:
+  <span class="tag ok">IMPLEMENTED</span>
+  <span class="tag partial">PARTIAL / TO FIX</span>
+  <span class="tag todo">NEW WORK</span></p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="problem">The "client holds only one RouteInfo" problem</h2>
+<div class="panel">
+<p>
+Today the client keeps a single <code>RouteResult</code> inside <code>ShardingInfo</code> and resolves every key
+through it: <code>hash(key) % (1&lt;&lt;shardFactor)</code> &rarr; <code>shardId</code> &rarr; the one cluster
+that currently owns that shard. There is no notion of "old map" vs "new map" &mdash; the client either has the
+<strong>pre-migration</strong> map or the <strong>post-migration</strong> map, never both at once.</p>
+<p class="cite">ShardingInfo.java:21 (single volatile RouteResult), :84-103 (getShardingClient), :49-76 (refreshClientMap monotonic by version)</p>
+
+<p>During a migration the key space is momentarily inconsistent with <em>any single</em> snapshot: a shard <code>S</code>
+is half-moved &mdash; some of its keys still live on the <strong>source</strong>, the rest already on the
+<strong>target</strong>. No single shard&rarr;cluster map can express "this key is on A but that key is on B for the
+same shard." So which map should the client hold?</p>
+
+<div class="callout ok2">
+<strong>The resolution: anchor to the source, let the server redirect per key.</strong> The client keeps the
+<em>pre-migration</em> map for the whole of <em>Phase&nbsp;A</em>. It always sends a migrating shard's keys to the
+<strong>source</strong>. The source answers authoritatively per key:
+<ul>
+  <li>key still present &rarr; serve it normally;</li>
+  <li>key already exported &rarr; <code>MIGRATED_ROUTE</code> with the target address &rarr; the client retries that
+      <em>single key</em> on the target (ASK), <strong>without</strong> mutating its cached map.</li>
+</ul>
+Only when the server <em>commits</em> the shard to its new owner (Phase&nbsp;B) and bumps <code>routeVersion</code>
+does the client swap to the new map &mdash; lazily, on the next <code>CLIENT_ROUTE_OUT_OF_DATE</code>. This way one
+RouteInfo is sufficient and correct; the per-key gap is filled by the transient ASK redirect, not by a second map.
+</div>
+
+<p>This is only safe because the server runs a <strong>two-phase route</strong>: ownership of a migrating shard stays
+on the source until migration of that shard finishes. If the OM flipped ownership the instant the ring is recomputed,
+the client's single map would point at a target that has no data yet. The client design below assumes the server
+honours that contract (server design &sect;1, "Two-phase route, Redis-style").</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="contract">The response-code contract</h2>
+<p>Every Object Store reply carries a <code>ResponseCode</code>. The client maps each code to exactly one action.
+Codes are defined in <code class="cite">protocols/common.proto:15-33</code>; the client dispatch table lives in
+<code class="cite">RaftClusterClient.java:230-245</code> and the action bodies in <code class="cite">RaftClusterClient.java:385-412</code>.</p>
+
+<table>
+<thead><tr><th>Code</th><th>Meaning (server)</th><th>Client action</th><th>Touches cached map?</th><th>Redis analogue</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>OK (200)</code> / <code>CREATED (201)</code></td>
+  <td>Served by the owning cluster.</td>
+  <td>Return result to caller.</td>
+  <td>No</td><td>&mdash;</td>
+</tr>
+<tr>
+  <td><code>NOT_LEADER (301)</code></td>
+  <td>Reached a follower of the right cluster.</td>
+  <td>Follow <code>leaderHint</code>, retry <em>same cluster</em>.</td>
+  <td>No (intra-cluster)</td><td>&mdash;</td>
+</tr>
+<tr>
+  <td><code>WRONG_ROUTE (450)</code> <span class="tag partial">FIX</span></td>
+  <td>Key's shard is not owned by this cluster <em>and</em> not being imported here. The client's map is wrong/stale.</td>
+  <td><strong>Refresh</strong> <code>RouteInfo</code> from OM, re-resolve the key, retry. <span class="muted">(Today: thrown as a fatal internal error.)</span></td>
+  <td>Yes &mdash; refresh</td><td>MOVED-ish</td>
+</tr>
+<tr>
+  <td><code>MIGRATED_ROUTE (451)</code></td>
+  <td>This <em>key</em> already exported to the target; <code>redirectAddress</code> = target cluster.</td>
+  <td>Get a <strong>redirect client</strong> for <code>redirectAddress</code>; retry <em>this key only</em>. Do <strong>not</strong> change cached map.</td>
+  <td>No</td><td><strong>ASK</strong></td>
+</tr>
+<tr>
+  <td><code>CLIENT_ROUTE_OUT_OF_DATE (452)</code></td>
+  <td>Server version &gt; client version: the shard owner has changed.</td>
+  <td><strong>Refresh</strong> <code>RouteInfo</code> from OM, re-resolve the key, retry.</td>
+  <td>Yes &mdash; refresh</td><td><strong>MOVED</strong></td>
+</tr>
+<tr>
+  <td><code>SERVER_ROUTE_OUT_OF_DATE (453)</code></td>
+  <td>Server version &lt; client version: server is behind and is refreshing.</td>
+  <td>Retry the <em>same address</em> (bounded backoff). Client map is newer &mdash; keep it.</td>
+  <td>No</td><td>&mdash;</td>
+</tr>
+<tr>
+  <td><code>PRECOND_NOT_MATCHED (409)</code></td>
+  <td>CAS / existence precondition failed.</td>
+  <td>Surface as a condition-not-met error. Not a routing event.</td>
+  <td>No</td><td>&mdash;</td>
+</tr>
+<tr>
+  <td><code>KEY_NOT_EXIST</code>, <code>BAD_REQUEST (400)</code>, <code>GENERAL_ERROR (503)</code></td>
+  <td>Application / transport outcomes.</td>
+  <td>Surface to caller; no re-routing.</td>
+  <td>No</td><td>&mdash;</td>
+</tr>
+</tbody>
+</table>
+
+<div class="callout warn">
+<strong>The version stamp is what makes 452/453 possible.</strong> The client must put its cached
+<code>routeVersion</code> on every Object Store request header. The server's <code>preExecute</code> compares
+<code>header.routeversion()</code> with its own and returns 452 (client behind) or 453 (server behind). If the
+client ever forgets to stamp, or stamps a stale value for a redirected request, the staleness handshake breaks.
+<span class="cite">server preExecute: ObjectStore.cpp:119-128; client stamp: StoreClusterClientImpl.updateRouteVersion :33-37, ShardingInfo getShardingClient :96-99.</span>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="state">Client routing state</h2>
+<p>All routing state is held by <code>ShardingInfo</code>, guarded by a <code>ReadWriteLock</code>. It has three parts:</p>
+<table>
+<thead><tr><th>Field</th><th>Role</th><th>Mutated by</th></tr></thead>
+<tbody>
+<tr><td><code>routeInfo : RouteResult</code></td><td>The single cached map: <code>routeVersion</code>, <code>shardFactor</code>, and the <code>List&lt;ShardCluster&gt;</code> (shard set per cluster).</td><td><code>refreshClientMap()</code> only, monotonically (ignores lower/equal versions).</td></tr>
+<tr><td><code>clientMap : Map&lt;address,StoreClusterClient&gt;</code></td><td>One pooled gRPC cluster client per owning cluster in the current map.</td><td>Rebuilt on every accepted refresh.</td></tr>
+<tr><td><em>redirect clients</em></td><td>Cluster clients for addresses learned from <code>MIGRATED_ROUTE</code> that are not (yet) in the map.</td><td><code>getRedirectClient(address)</code>, lazily, kept in the same <code>clientMap</code>.</td></tr>
+</tbody>
+</table>
+<p class="cite">ShardingInfo.java:20-24 (fields), :49-77 (refreshClientMap, version-monotone), :110-138 (getRedirectClient lazily caches by address).</p>
+
+<figure>
+<svg viewBox="0 0 980 250" role="img" aria-label="Client routing state">
+  <rect x="20" y="30" width="250" height="190" rx="10" fill="#161b22" stroke="#2d3742"/>
+  <text x="145" y="55" text-anchor="middle" class="svgtext" font-weight="700">ShardingInfo</text>
+  <rect x="40" y="70" width="210" height="40" rx="6" fill="#1c232d" stroke="#2d3742"/>
+  <text x="145" y="88" text-anchor="middle" class="svgtext">routeInfo (RouteResult)</text>
+  <text x="145" y="103" text-anchor="middle" class="svgsmall">version, shardFactor, shardClusters</text>
+  <rect x="40" y="120" width="210" height="36" rx="6" fill="#1c232d" stroke="#2d3742"/>
+  <text x="145" y="143" text-anchor="middle" class="svgtext">clientMap[address]</text>
+  <rect x="40" y="166" width="210" height="40" rx="6" fill="#1c232d" stroke="#2d3742"/>
+  <text x="145" y="184" text-anchor="middle" class="svgtext">redirect clients</text>
+  <text x="145" y="199" text-anchor="middle" class="svgsmall">learned from MIGRATED_ROUTE</text>
+
+  <rect x="380" y="60" width="240" height="60" rx="10" fill="#11202e" stroke="#4f9cff"/>
+  <text x="500" y="86" text-anchor="middle" class="svgtext" font-weight="700">Object Manager (OM)</text>
+  <text x="500" y="104" text-anchor="middle" class="svgsmall">route() &rarr; RouteInfo(version)</text>
+
+  <rect x="380" y="150" width="240" height="60" rx="10" fill="#13251c" stroke="#3fb950"/>
+  <text x="500" y="176" text-anchor="middle" class="svgtext" font-weight="700">OS source / target clusters</text>
+  <text x="500" y="194" text-anchor="middle" class="svgsmall">stamped routeVersion on each call</text>
+
+  <line x1="270" y1="90" x2="380" y2="90" stroke="#4f9cff" stroke-width="2" marker-end="url(#a)"/>
+  <text x="325" y="82" text-anchor="middle" class="svgsmall">refresh</text>
+  <line x1="270" y1="180" x2="380" y2="180" stroke="#3fb950" stroke-width="2" marker-end="url(#a)"/>
+  <text x="325" y="172" text-anchor="middle" class="svgsmall">read/write</text>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#9aa7b4"/></marker></defs>
+</svg>
+<figcaption>The client learns the map from the OM, then talks directly to OS clusters, stamping <code>routeVersion</code> on every request.</figcaption>
+</figure>
+
+<!-- ===================================================================== -->
+<h2 id="route">Routing decision for a key</h2>
+<p><code>getShardingClient(key)</code> resolves a key to a cluster client under the read lock:</p>
+<pre>shardId  = key startsWith "/RMSTRX"  ?  RMSTRX_SHARD_IDX
+                                     :  hash(key) % (1 &lt;&lt; routeInfo.shardFactor)
+cluster  = the ShardCluster whose shardInfo set contains shardId
+client   = clientMap[cluster.address]
+client.updateRouteVersion(routeInfo.routeVersion)   // stamp the version we are routing against
+return client</pre>
+<p class="cite">ShardingInfo.java:84-103. The <code>shardFactor</code> (12 &rArr; 4096 shards) and the per-shard ownership both come from the OM's <code>RouteInfo</code>, so the client never hardcodes placement.</p>
+<div class="callout">
+<strong>Invariant.</strong> The version stamped on a request must be the version of the map used to <em>pick the
+cluster</em>. A redirect client (ASK target) is an exception &mdash; see <a href="#ask">&sect;ASK</a> for the
+version it must carry.</div>
+
+<!-- ===================================================================== -->
+<h2 id="loop">The execute / retry loop</h2>
+<p>All single-key operations funnel through <code>ShardingClientImpl.execute(request, key, caller)</code>, a loop that
+re-resolves and retries on routing exceptions and returns on success. Each routing code surfaces as a typed
+exception from <code>RaftClusterClient</code>, which the loop catches.</p>
+<p class="cite">ShardingClientImpl.java:271-298 (loop); exceptions in com.ebay.payments.raft.client.exceptions.</p>
+
+<div class="grid2">
+<div class="panel">
+<h3>Today</h3>
+<pre>while (true) {
+  try {
+    if (client == null)
+      client = getShardingClient(key);
+    return caller.call(req, client);
+
+  } catch (RouteOutOfDate e) {        // 452
+    refreshClientMap(om.route());
+    client = getShardingClient(key);
+
+  } catch (MigratedRoute e) {         // 451
+    client = getRedirectClient(
+               e.getRedirectAddress());
+
+  } catch (WrongRoute e) {            // 450
+    throw new GoblinInternalException(e); // FATAL
+  } catch ( ... ) { throw ...; }
+}</pre>
+<p class="muted">453 is absorbed inside <code>RaftClusterClient</code> as a same-address retry, so the loop never sees it.
+<span class="cite">RaftClusterClient.java:410-413.</span></p>
+</div>
+<div class="panel">
+<h3>Target (this design)</h3>
+<pre>attempts = 0
+while (true) {
+  try {
+    if (client == null)
+      client = getShardingClient(key);
+    return caller.call(req, client);
+
+  } catch (RouteOutOfDate e) {        // 452 MOVED
+    refreshClientMap(om.route());
+    client = getShardingClient(key);
+
+  } catch (MigratedRoute e) {         // 451 ASK
+    client = getRedirectClient(
+               e.getRedirectAddress());
+    // one-shot: next failure re-resolves
+
+  } catch (WrongRoute e) {            // 450
+    refreshClientMap(om.route());     // FIX: refresh+retry
+    client = getShardingClient(key);
+
+  } finally bound(++attempts);        // cap + backoff
+}</pre>
+<p class="muted">Two behavioural fixes: <code>WRONG_ROUTE</code> becomes a refresh-and-retry instead of fatal, and the
+loop is bounded to prevent a redirect/refresh storm.</p>
+</div>
+</div>
+
+<div class="callout warn">
+<strong>Why bound the loop?</strong> 451/452/450 all re-enter the loop. In a pathological race (e.g. the OM commits
+a flip exactly as the client refreshes, or the target itself reports a stale version) the client could ping-pong
+source&harr;target. A bounded attempt counter with small backoff, and re-resolving from the fresh map after a
+refresh, guarantees forward progress. Today the loop is unbounded.
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="ask">ASK path &mdash; <code>MIGRATED_ROUTE (451)</code> in detail</h2>
+<p>This is the heart of "one RouteInfo is enough." While shard <code>S</code> is <code>EXPORTING</code> on the source,
+the client keeps routing <code>S</code>'s keys to the source. For a key already exported, the source returns 451 with
+<code>routeHint = target</code>. The client retries <em>only that key</em> on the target, which is <code>IMPORTING</code>
+<code>S</code> and therefore accepts it.</p>
+
+<figure>
+<svg viewBox="0 0 980 360" role="img" aria-label="ASK redirect for a migrating key">
+  <defs><marker id="b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#9aa7b4"/></marker></defs>
+  <rect x="40"  y="30" width="170" height="44" rx="8" fill="#11202e" stroke="#4f9cff"/>
+  <text x="125" y="57" text-anchor="middle" class="svgtext" font-weight="700">Client</text>
+  <rect x="420" y="30" width="190" height="44" rx="8" fill="#13251c" stroke="#3fb950"/>
+  <text x="515" y="51" text-anchor="middle" class="svgtext" font-weight="700">Source (owns S)</text>
+  <text x="515" y="66" text-anchor="middle" class="svgsmall">shard S = EXPORTING</text>
+  <rect x="780" y="30" width="170" height="44" rx="8" fill="#241a2e" stroke="#bc8cff"/>
+  <text x="865" y="51" text-anchor="middle" class="svgtext" font-weight="700">Target</text>
+  <text x="865" y="66" text-anchor="middle" class="svgsmall">shard S = IMPORTING</text>
+
+  <line x1="125" y1="74" x2="125" y2="340" stroke="#2d3742"/>
+  <line x1="515" y1="74" x2="515" y2="340" stroke="#2d3742"/>
+  <line x1="865" y1="74" x2="865" y2="340" stroke="#2d3742"/>
+
+  <line x1="125" y1="110" x2="515" y2="110" stroke="#9aa7b4" stroke-width="2" marker-end="url(#b)"/>
+  <text x="320" y="103" text-anchor="middle" class="svgsmall">get/put key k (stamp version v)</text>
+
+  <line x1="515" y1="150" x2="125" y2="150" stroke="#d29922" stroke-width="2" marker-end="url(#b)"/>
+  <text x="320" y="143" text-anchor="middle" class="svgsmall">451 MIGRATED_ROUTE, redirect = Target</text>
+  <text x="320" y="167" text-anchor="middle" class="svgsmall">(k already exported &rarr; readMeta NotFound)</text>
+
+  <line x1="125" y1="210" x2="865" y2="210" stroke="#bc8cff" stroke-width="2" marker-end="url(#b)"/>
+  <text x="495" y="203" text-anchor="middle" class="svgsmall">retry key k on redirect client (ASK)</text>
+
+  <line x1="865" y1="250" x2="125" y2="250" stroke="#3fb950" stroke-width="2" marker-end="url(#b)"/>
+  <text x="495" y="243" text-anchor="middle" class="svgsmall">200 OK (Target serves imported key)</text>
+
+  <text x="125" y="300" text-anchor="middle" class="svgsmall">cached map UNCHANGED</text>
+  <text x="125" y="316" text-anchor="middle" class="svgsmall">next key of S still &rarr; Source</text>
+</svg>
+<figcaption>ASK is per-key and transient: the map is not mutated, so the very next request for shard <code>S</code> goes to the source again.</figcaption>
+</figure>
+
+<h3>Rules for the redirect client</h3>
+<ul>
+  <li><strong>One-shot.</strong> Use the redirect client for the immediate retry of this key only. Do not pin it for
+      subsequent operations &mdash; the next call re-resolves through the map so that, once the shard commits, traffic
+      naturally follows the new owner via 452.</li>
+  <li><strong>Lazy, cached by address.</strong> <code>getRedirectClient(address)</code> reuses an existing pooled client
+      when the target is already in <code>clientMap</code> (it usually is &mdash; both source and target exist in the
+      pre-migration map), otherwise it creates and caches one. <span class="cite">ShardingInfo.java:110-138.</span></li>
+  <li><strong>Version to stamp on the ASK retry.</strong> The redirected request must carry a version the target will
+      accept. Since the target legitimately owns/imports <code>S</code> at the <em>same</em> <code>routeVersion</code>
+      the client is on, stamp the client's current cached version. If the target replies 452, fall through to a normal
+      refresh; if 453, retry the same target. <span class="tag partial">verify createRedirectClient stamps a version</span></li>
+  <li><strong>Nested redirect.</strong> If the target itself returns 451 (rare; the key moved again), follow the new
+      hint within the bounded attempt budget rather than looping unboundedly.</li>
+</ul>
+<div class="callout danger">
+<strong>Pitfall to avoid.</strong> Never treat a 451 as a reason to mutate the cached map or bump
+<code>routeVersion</code>. Doing so would send <em>all</em> of shard <code>S</code> to the target while the source is
+still the owner of the not-yet-migrated keys &mdash; those keys would then bounce back, defeating the source anchor.
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="moved">MOVED path &mdash; <code>CLIENT_ROUTE_OUT_OF_DATE (452)</code> and <code>WRONG_ROUTE (450)</code></h2>
+<p>When the OM commits a shard to its new owner (Phase&nbsp;B) it bumps <code>RouteInfo.version</code>. The next time the
+client hits the <em>old</em> owner with the stale version, <code>preExecute</code> sees
+<code>serverVersion &gt; clientVersion</code> and returns 452. The client then refreshes from the OM and re-resolves
+&mdash; now the key maps straight to the new owner.</p>
+
+<figure>
+<svg viewBox="0 0 980 300" role="img" aria-label="MOVED refresh after route flip">
+  <defs><marker id="c" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 z" fill="#9aa7b4"/></marker></defs>
+  <rect x="40"  y="30" width="160" height="44" rx="8" fill="#11202e" stroke="#4f9cff"/>
+  <text x="120" y="57" text-anchor="middle" class="svgtext" font-weight="700">Client (v=7)</text>
+  <rect x="400" y="30" width="180" height="44" rx="8" fill="#13251c" stroke="#3fb950"/>
+  <text x="490" y="57" text-anchor="middle" class="svgtext" font-weight="700">Old owner</text>
+  <rect x="770" y="30" width="170" height="44" rx="8" fill="#11202e" stroke="#4f9cff"/>
+  <text x="855" y="57" text-anchor="middle" class="svgtext" font-weight="700">OM</text>
+
+  <line x1="120" y1="74" x2="120" y2="280" stroke="#2d3742"/>
+  <line x1="490" y1="74" x2="490" y2="280" stroke="#2d3742"/>
+  <line x1="855" y1="74" x2="855" y2="280" stroke="#2d3742"/>
+
+  <line x1="120" y1="105" x2="490" y2="105" stroke="#9aa7b4" stroke-width="2" marker-end="url(#c)"/>
+  <text x="300" y="98" text-anchor="middle" class="svgsmall">request key k, stamp v=7</text>
+  <line x1="490" y1="140" x2="120" y2="140" stroke="#d29922" stroke-width="2" marker-end="url(#c)"/>
+  <text x="300" y="133" text-anchor="middle" class="svgsmall">452 CLIENT_ROUTE_OUT_OF_DATE (server v=8)</text>
+  <line x1="120" y1="180" x2="855" y2="180" stroke="#4f9cff" stroke-width="2" marker-end="url(#c)"/>
+  <text x="480" y="173" text-anchor="middle" class="svgsmall">route() refresh</text>
+  <line x1="855" y1="215" x2="120" y2="215" stroke="#4f9cff" stroke-width="2" marker-end="url(#c)"/>
+  <text x="480" y="208" text-anchor="middle" class="svgsmall">RouteInfo v=8 (S now &rarr; new owner)</text>
+  <text x="120" y="255" text-anchor="middle" class="svgsmall">re-resolve k &rarr; new owner, retry, 200 OK</text>
+</svg>
+<figcaption>452 is the stable flip: refresh once, and the cached map permanently routes the shard to the new owner.</figcaption>
+</figure>
+
+<h3>Refresh discipline</h3>
+<ul>
+  <li><strong>Monotonic.</strong> <code>refreshClientMap</code> ignores a fetched map whose version is &le; the cached
+      version, so concurrent refreshes and an OM that briefly serves an older snapshot cannot regress the client.
+      <span class="cite">ShardingInfo.java:49-58.</span></li>
+  <li><strong>Re-resolve, don't reuse.</strong> After a refresh the loop must call <code>getShardingClient(key)</code>
+      again; the previously chosen cluster client may no longer own the key.</li>
+  <li><strong>WRONG_ROUTE (450) is the safety net.</strong> 450 means the contacted cluster owns neither the live nor the
+      importing copy of the key &mdash; the client's map is simply wrong (e.g. it skipped a version, or contacted a
+      redirect address that has since handed the shard off). Treat it like 452: refresh from the OM and retry. Only after
+      exhausting the bounded attempts should it surface as an error.</li>
+  <li><strong>Coalesce refreshes.</strong> Many in-flight requests can hit 452 at once. The refresh should be
+      single-flighted (one OM <code>route()</code> call, shared result) to avoid stampeding the OM; the version-monotone
+      guard already makes redundant refreshes cheap no-ops.</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="edge">Edge cases &amp; correctness notes</h2>
+
+<h3>Multi-key transactions and batches during migration</h3>
+<p><code>commitTransaction</code> requires all keys to be in one shard via <code>isInSameShard</code>, and routes the
+batch by the first key. During migration two hazards appear:</p>
+<ul>
+  <li><strong>Per-key redirect cannot apply to a batch.</strong> A 451 redirects a single key, but a transaction is one
+      RPC over many keys. If a migrating shard's batch lands on the source while some of its keys already moved, the
+      atomic <em>Migrate</em> command and the per-key lock on the server keep the batch serialized either fully before
+      or fully after migration of those keys &mdash; the client simply retries the batch (on 451 follow the hint for the
+      whole batch to the target; on 452 refresh and retry). The batch must <em>not</em> be split across source and
+      target by the client.</li>
+  <li><strong>Shard membership can change under a refresh.</strong> <code>isInSameShard</code> is evaluated against the
+      cached map; after a flip the same keys may map to different clusters only if they were in different shards (they
+      were not, by the in-one-shard check), so a same-shard batch stays same-cluster across the flip. Re-validate
+      <code>isInSameShard</code> after any forced refresh before retrying. <span class="cite">ShardingClientImpl.java:130-170; ShardingInfo.java:140-156.</span></li>
+</ul>
+
+<h3>Stale (follower) reads during migration</h3>
+<p><code>get(allowStale=true)</code> is routed to a follower of the source. A follower may briefly lag the leader's
+migration progress, so a stale read of a just-migrated key can return an old value or trigger 451 from the follower.
+This is acceptable for stale reads by definition; clients needing exact post-migration values must use a leader read.</p>
+
+<h3>Redirect-client lifecycle</h3>
+<p>Addresses learned via 451 are cached in <code>clientMap</code>. Once a migration completes and the client refreshes,
+<code>refreshClientMap</code> rebuilds <code>clientMap</code> from the new map and reuses still-present clients while
+dropping ones no longer referenced. Transient redirect entries for clusters that remain in the new map survive; ones
+for clusters that left are garbage-collected on the next refresh. No explicit redirect eviction is required.
+<span class="cite">ShardingInfo.java:59-74.</span></p>
+
+<h3>Version stamping on redirected requests</h3>
+<p>The single subtle invariant: a request must never reach a cluster carrying a version that cluster will reject as
+<em>too new</em> for no reason. Because source and target share the same <code>routeVersion</code> during Phase&nbsp;A,
+stamping the client's current cached version on both the normal and the ASK-redirected request is correct. After the
+flip, the only stale party is the client, which is corrected by 452.</p>
+
+<h3>OM unavailability</h3>
+<p>If <code>route()</code> fails during a forced refresh (452/450), the client cannot make progress for that key. It
+should retry the OM with backoff inside the bounded budget and surface a timeout/general error if the OM stays
+unreachable, rather than spinning. The existing single OM client is the refresh source. <span class="cite">ShardingClientImpl.java:67-73.</span></p>
+
+<!-- ===================================================================== -->
+<h2 id="gaps">Gaps in the current client</h2>
+<table>
+<thead><tr><th>#</th><th>Area</th><th>Current behaviour</th><th>Needed</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>WRONG_ROUTE (450)</td><td>Wrapped and thrown as <code>GoblinInternalException</code> &mdash; fatal to the call.</td><td>Refresh <code>RouteInfo</code> and retry within the bounded budget; only fail after exhaustion.</td><td><span class="tag partial">PARTIAL</span></td></tr>
+<tr><td>2</td><td>Retry bound</td><td><code>while(true)</code> with no attempt cap or backoff.</td><td>Bounded attempts + small backoff across 450/451/452 to guarantee progress.</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>3</td><td>ASK version stamp</td><td>Redirect client built from address; version stamped on it not explicit.</td><td>Stamp the current cached <code>routeVersion</code> on the ASK retry; fall through to refresh on 452.</td><td><span class="tag partial">PARTIAL</span></td></tr>
+<tr><td>4</td><td>Refresh coalescing</td><td>Each 452 calls <code>om.route()</code> independently.</td><td>Single-flight the OM refresh; rely on version-monotone guard for dedupe.</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>5</td><td>Batch redirect</td><td>Transaction routed by first key; no migration-aware retry beyond loop.</td><td>Treat 451/452 on a same-shard batch as a whole-batch retry/redirect; re-validate <code>isInSameShard</code> after refresh.</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>6</td><td>Version stamping</td><td><code>updateRouteVersion</code> set at resolve time.</td><td>Guarantee the stamp equals the map version used to pick the cluster, including redirects.</td><td><span class="tag ok">IMPLEMENTED</span></td></tr>
+</tbody>
+</table>
+
+<!-- ===================================================================== -->
+<h2 id="plan">Implementation work plan</h2>
+<table>
+<thead><tr><th>#</th><th>Item</th><th>Where</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>1</td><td>Make <code>WRONG_ROUTE</code> refresh-and-retry instead of fatal.</td><td>ShardingClientImpl.execute :286-291</td><td><span class="tag partial">PARTIAL</span></td></tr>
+<tr><td>2</td><td>Add bounded attempts + backoff to the retry loop.</td><td>ShardingClientImpl.execute :271-298</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>3</td><td>Make the ASK redirect strictly one-shot and explicitly versioned.</td><td>ShardingInfo.getRedirectClient :110-138</td><td><span class="tag partial">PARTIAL</span></td></tr>
+<tr><td>4</td><td>Single-flight OM refresh; keep version-monotone guard.</td><td>ShardingInfo.refreshClientMap :49-77</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>5</td><td>Migration-aware batch/transaction retry; re-validate one-shard after refresh.</td><td>ShardingClientImpl.commitTransaction :130-170</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>6</td><td>Metrics: count 450/451/452/453 and redirect/refresh retries per method.</td><td>ShardingClientImpl.trackMetrics :230-268</td><td><span class="tag todo">NEW</span></td></tr>
+</tbody>
+</table>
+
+<div class="callout ok2">
+<strong>Bottom line.</strong> One cached <code>RouteInfo</code> is sufficient for correct routing during online
+migration <em>provided</em> the client (a) anchors migrating-shard keys to the source, (b) honours
+<code>MIGRATED_ROUTE</code> as a per-key, map-preserving ASK redirect, and (c) refreshes only on
+<code>CLIENT_ROUTE_OUT_OF_DATE</code>/<code>WRONG_ROUTE</code> as a MOVED-style flip. The server's two-phase route and
+atomic Migrate command guarantee the per-key answers the client relies on. The remaining client work is hardening:
+fix 450, bound retries, make ASK one-shot, coalesce refreshes, and extend the same rules to batches.
+</div>
+
+<p class="muted" style="margin-top:40px">Companion document: <code>doc/dynamic_sharding_design_v2.html</code> (server-side target design). Code references are to the Goblin Java client under <code>client/goblin-java-client</code> and the protobuf under <code>protocols/common.proto</code>.</p>
+
+</div>
+</body>
+</html>
