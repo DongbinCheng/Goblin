@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<!--
+Copyright 2021-2022 eBay Inc.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+    https://www.apache.org/licenses/LICENSE-2.0
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Goblin Dynamic Sharding v2 &mdash; Target Design (Redis-Cluster style)</title>
+<style>
+  :root{
+    --bg:#0f1218; --panel:#161b22; --panel2:#1c232d; --ink:#e6edf3; --muted:#9aa7b4;
+    --line:#2d3742; --accent:#4f9cff; --green:#3fb950; --amber:#d29922; --red:#f85149;
+    --purple:#bc8cff; --teal:#39c5bb; --code:#0b0f14;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;}
+  header{padding:32px 40px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,#11161d,#0f1218);}
+  header h1{margin:0 0 6px;font-size:26px}
+  header p{margin:0;color:var(--muted)}
+  .wrap{max-width:1180px;margin:0 auto;padding:0 24px 80px}
+  nav{position:sticky;top:0;background:rgba(15,18,24,.92);backdrop-filter:blur(6px);
+    border-bottom:1px solid var(--line);padding:10px 24px;z-index:50;font-size:13px}
+  nav a{color:var(--accent);text-decoration:none;margin-right:16px;white-space:nowrap}
+  nav a:hover{text-decoration:underline}
+  h2{margin:48px 0 8px;font-size:21px;border-left:4px solid var(--accent);padding-left:12px}
+  h3{margin:28px 0 6px;font-size:17px;color:#cdd9e5}
+  p{color:#cdd9e5}
+  .muted{color:var(--muted)}
+  code{background:var(--code);padding:1px 6px;border-radius:5px;color:#c9d1d9;
+    font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:13px}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:8px;padding:14px 16px;
+    overflow:auto;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12.5px;color:#c9d1d9}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px 22px;margin:16px 0}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:860px){.grid2{grid-template-columns:1fr}}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:13.5px}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:#cdd9e5}
+  td code{font-size:12px}
+  .tag{display:inline-block;font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;border:1px solid}
+  .ok{color:var(--green);border-color:var(--green);background:rgba(63,185,80,.08)}
+  .partial{color:var(--amber);border-color:var(--amber);background:rgba(210,153,34,.08)}
+  .todo{color:var(--red);border-color:var(--red);background:rgba(248,81,73,.08)}
+  .legend span{margin-right:18px;font-size:12.5px}
+  figure{margin:18px 0;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  figcaption{color:var(--muted);font-size:12.5px;margin-top:8px;text-align:center}
+  .cite{color:var(--purple);font-size:12px;font-family:ui-monospace,monospace}
+  svg{display:block;margin:0 auto;max-width:100%;height:auto}
+  .svgtext{fill:var(--ink);font:13px -apple-system,Segoe UI,Roboto,sans-serif}
+  .svgsmall{fill:var(--muted);font:11px ui-monospace,monospace}
+  .svglabel{fill:#0b0f14;font:12px -apple-system,Segoe UI,Roboto,sans-serif;font-weight:600}
+  ul li{margin:3px 0}
+  .callout{border-left:4px solid var(--teal);background:rgba(57,197,187,.06);padding:10px 14px;border-radius:0 8px 8px 0;margin:12px 0}
+  .warn{border-left-color:var(--amber);background:rgba(210,153,34,.06)}
+  .danger{border-left-color:var(--red);background:rgba(248,81,73,.06)}
+  .ok2{border-left-color:var(--green);background:rgba(63,185,80,.06)}
+  .step{display:inline-block;width:22px;height:22px;border-radius:50%;background:var(--accent);
+    color:#06101f;font-weight:700;text-align:center;line-height:22px;font-size:12px;margin-right:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Goblin Dynamic Sharding &mdash; v2 Target Design</h1>
+  <p>An online (live-traffic) shard-migration design for the Object Store, modelled on Redis Cluster slot migration. Grounded in the code currently in this repository.</p>
+</header>
+
+<nav>
+  <a href="#tldr">TL;DR</a>
+  <a href="#redis">Redis model</a>
+  <a href="#req">Requirements</a>
+  <a href="#route">1 &middot; Route change</a>
+  <a href="#task">2 &middot; Migration task</a>
+  <a href="#labels">3 &middot; Shard labels</a>
+  <a href="#redirect">4 &middot; Client redirect</a>
+  <a href="#migcmd">5 &middot; Migrate command</a>
+  <a href="#flow">End-to-end</a>
+  <a href="#proto">Proto / API</a>
+  <a href="#plan">Work plan</a>
+</nav>
+
+<div class="wrap">
+
+<!-- ===================================================================== -->
+<h2 id="tldr">TL;DR</h2>
+<div class="panel">
+<p>
+The key space is split into <strong>4096 fixed shards</strong> (<code>hash(key) &amp; (2^12-1)</code>). The
+<strong>Object Manager (OM)</strong> is a Raft control plane that owns a consistent-hash ring mapping
+<em>shard&nbsp;&rarr;&nbsp;cluster</em> and publishes it as a versioned <code>RouteInfo</code>. Each
+<strong>Object Store (OS)</strong> is itself a Raft cluster that stores the data for the shards it owns.
+</p>
+<p>This v2 design makes migration <strong>online</strong> &mdash; the cluster keeps serving while data
+moves &mdash; using five mechanisms that mirror Redis Cluster:</p>
+<ul>
+  <li><span class="step">1</span><b>Admin-driven route change.</b> <code>addCluster</code>/<code>removeCluster</code> to the OM (one OM per <code>app_env</code>) recomputes the ring and bumps <code>RouteInfo.version</code>.</li>
+  <li><span class="step">2</span><b>Per-shard migration tasks</b> are delivered to the source OS clusters that must hand shards over.</li>
+  <li><span class="step">3</span><b>Shard-level <code>IMPORTING</code>/<code>EXPORTING</code> labels</b> (not cluster-level) track each shard's migration state &mdash; exactly Redis' per-slot <code>MIGRATING</code>/<code>IMPORTING</code>.</li>
+  <li><span class="step">4</span><b>Source-anchored reads/writes.</b> Clients always hit the <em>source</em> first; if the key is still there the source serves it, otherwise the client gets <code>MIGRATED_ROUTE</code> and retries the target &mdash; Redis' <code>ASK</code> redirection.</li>
+  <li><span class="step">5</span><b>An atomic <code>Migrate</code> command</b> holds the per-key lock across <em>export&nbsp;+&nbsp;delete</em>, closing the copy-then-delete race &mdash; Redis' atomic <code>MIGRATE</code>.</li>
+</ul>
+<p class="muted">Legend used below:
+  <span class="tag ok">IMPLEMENTED</span>
+  <span class="tag partial">PARTIAL / TO WIRE</span>
+  <span class="tag todo">NEW WORK</span>
+</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="redis">How Redis Cluster does it (reference model)</h2>
+<div class="panel">
+<p>Redis Cluster moves data one <em>slot</em> at a time while staying available. The pieces we borrow:</p>
+<table>
+<tr><th>Redis concept</th><th>What it does</th><th>Goblin equivalent in this design</th></tr>
+<tr><td><code>CLUSTER SETSLOT &lt;slot&gt; MIGRATING &lt;dst&gt;</code> (on source)<br><code>... IMPORTING &lt;src&gt;</code> (on target)</td>
+    <td>Marks a single slot as leaving / arriving. Per-slot, not per-node.</td>
+    <td>Per-<b>shard</b> <code>EXPORTING</code>/<code>IMPORTING</code> label (req&nbsp;3).</td></tr>
+<tr><td><code>MIGRATE</code> command</td>
+    <td>Atomically <code>DUMP</code> + <code>RESTORE</code> on target + <code>DEL</code> on source for a key (or batch).</td>
+    <td>New <code>Migrate</code> command holding the key lock across export+delete (req&nbsp;5).</td></tr>
+<tr><td><code>ASK</code> redirection</td>
+    <td>Transient, <em>per-key</em>: "this key already moved, ask the target <em>this once</em>." Route is not yet changed.</td>
+    <td><code>MIGRATED_ROUTE</code> with <code>routeHint</code> (req&nbsp;4).</td></tr>
+<tr><td><code>MOVED</code> redirection</td>
+    <td>Stable: "this slot now belongs to another node, update your map."</td>
+    <td><code>WRONG_ROUTE</code> / <code>CLIENT_ROUTE_OUT_OF_DATE</code> &rarr; refresh <code>RouteInfo</code> from OM.</td></tr>
+<tr><td><code>ASKING</code> flag</td>
+    <td>Target accepts a key for an importing slot only if the client first sent <code>ASKING</code>.</td>
+    <td>Target accepts keys for shards it is <code>IMPORTING</code> (the migration-set check).</td></tr>
+</table>
+<div class="callout">
+<b>The single most important borrow:</b> in Redis the <em>source remains the source of truth</em> for a
+migrating slot until the slot is fully moved and the route is flipped. Clients are anchored to the source and
+only bounce to the target per-key via <code>ASK</code>. Goblin already encodes this with <code>MIGRATED_ROUTE</code>;
+v2 makes it correct and complete.
+</div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="req">Requirements &rarr; design mapping</h2>
+<div class="panel">
+<table>
+<tr><th>#</th><th>Requirement</th><th>Design section</th><th>Status today</th></tr>
+<tr><td>1</td><td>Admin <code>addCluster</code>/<code>removeCluster</code> to OM updates <code>RouteInfo</code> (version + shard&rarr;cluster map).</td><td><a href="#route">&sect;1</a></td><td><span class="tag partial">PARTIAL</span> route fill works; migration trigger commented out</td></tr>
+<tr><td>2</td><td>Migration task delivered to the OS shards that must migrate (pull vs push).</td><td><a href="#task">&sect;2</a></td><td><span class="tag partial">PARTIAL</span> task model + StartMigration RPC exist</td></tr>
+<tr><td>3</td><td><code>IMPORTING</code>/<code>EXPORTING</code> labels per shard (shard-level vs cluster-level decision).</td><td><a href="#labels">&sect;3</a></td><td><span class="tag todo">NEW</span> labels are cluster-level today</td></tr>
+<tr><td>4</td><td>Client anchors to source; served if key present, else <code>MIGRATED_ROUTE</code> &rarr; retry target.</td><td><a href="#redirect">&sect;4</a></td><td><span class="tag partial">PARTIAL</span> logic present, presence-based</td></tr>
+<tr><td>5</td><td>Atomic <code>Migrate</code> command: lock key across export+delete, then release.</td><td><a href="#migcmd">&sect;5</a></td><td><span class="tag todo">NEW</span> export &amp; delete are separate commands today</td></tr>
+</table>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="arch">Component architecture</h2>
+<figure>
+<svg viewBox="0 0 1000 360" role="img" aria-label="Architecture">
+  <!-- clients -->
+  <rect x="30" y="150" width="170" height="70" rx="10" fill="#1c232d" stroke="#2d3742"/>
+  <text x="115" y="180" text-anchor="middle" class="svgtext">Client(s)</text>
+  <text x="115" y="200" text-anchor="middle" class="svgsmall">cache RouteInfo (version)</text>
+  <!-- OM -->
+  <rect x="400" y="20" width="220" height="110" rx="10" fill="#10202f" stroke="#4f9cff"/>
+  <text x="510" y="48" text-anchor="middle" class="svgtext">Object Manager (OM)</text>
+  <text x="510" y="68" text-anchor="middle" class="svgsmall">Raft control plane / one per app_env</text>
+  <text x="510" y="86" text-anchor="middle" class="svgsmall">HashRing(4096) &rarr; RouteInfo(version)</text>
+  <text x="510" y="104" text-anchor="middle" class="svgsmall">ClusterSetManager + Migration tasks</text>
+  <!-- OS A -->
+  <rect x="330" y="240" width="200" height="100" rx="10" fill="#13261a" stroke="#3fb950"/>
+  <text x="430" y="266" text-anchor="middle" class="svgtext">OS cluster A (source)</text>
+  <text x="430" y="286" text-anchor="middle" class="svgsmall">KVEngine + RocksDB CFs</text>
+  <text x="430" y="304" text-anchor="middle" class="svgsmall">shard label: EXPORTING</text>
+  <text x="430" y="322" text-anchor="middle" class="svgsmall">MigrationManager (scan/migrate)</text>
+  <!-- OS B -->
+  <rect x="600" y="240" width="200" height="100" rx="10" fill="#241a26" stroke="#bc8cff"/>
+  <text x="700" y="266" text-anchor="middle" class="svgtext">OS cluster B (target)</text>
+  <text x="700" y="286" text-anchor="middle" class="svgsmall">KVEngine + RocksDB CFs</text>
+  <text x="700" y="304" text-anchor="middle" class="svgsmall">shard label: IMPORTING</text>
+  <text x="700" y="322" text-anchor="middle" class="svgsmall">MigrateBatch handler (new)</text>
+  <!-- edges -->
+  <line x1="200" y1="175" x2="400" y2="95" stroke="#4f9cff" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="300" y="120" text-anchor="middle" class="svgsmall">getRouteInfo</text>
+  <line x1="200" y1="195" x2="330" y2="280" stroke="#3fb950" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="250" y="255" text-anchor="middle" class="svgsmall">read/write (anchored to source)</text>
+  <line x1="510" y1="130" x2="430" y2="240" stroke="#4f9cff" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="430" y="200" text-anchor="middle" class="svgsmall">StartMigration</text>
+  <line x1="530" y1="300" x2="600" y2="300" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="565" y="292" text-anchor="middle" class="svgsmall">MigrateBatch</text>
+  <line x1="700" y1="240" x2="560" y2="130" stroke="#d29922" stroke-width="1.5" marker-end="url(#a)"/>
+  <text x="660" y="195" text-anchor="middle" class="svgsmall">OnMigration progress</text>
+  <defs><marker id="a" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/></marker></defs>
+</svg>
+<figcaption>Two services, both Gringofts Raft. Clients learn the route from OM, then talk directly to the owning OS cluster.</figcaption>
+</figure>
+
+<!-- ===================================================================== -->
+<h2 id="route">1 &middot; Admin-driven route change at the OM</h2>
+<div class="panel">
+<p>An operator adds or removes capacity by calling the OM (one OM owns the cluster-set for an <code>app_env</code>):</p>
+<ol>
+  <li><b>addCluster.</b> OM assigns a cluster id, inserts it into the consistent-hash ring, and recomputes which shards each cluster owns. The set of shards that change owner becomes the migration plan.
+    <div class="cite">server/src/object-manager/module/ClusterSetManager.cpp:395-437 (onboardCluster), server/src/object-manager/route/HashRing.h</div></li>
+  <li><b>removeCluster (scale-in).</b> Symmetric: the leaving cluster's shards are reassigned to the remaining clusters; those become migrations <em>out of</em> the leaving cluster. (Today <code>removeCluster</code> is a stub.)</li>
+  <li><b>Bump <code>RouteInfo.version</code>.</b> Partition/placement changes increment the version so every OS and client can detect staleness.
+    <div class="cite">protocols/common.proto:78-82 (RouteInfo.version), ClusterSetManager.cpp:328-377 (fillRouteInfo)</div></li>
+</ol>
+<div class="callout warn">
+<b>Two-phase route, Redis-style.</b> The new ownership must <em>not</em> take effect for clients the instant the
+ring is recomputed &mdash; otherwise clients would route to a target that has no data yet. As in Redis
+(<code>SETSLOT</code> on src/dst first, <code>SETSLOT &lt;slot&gt; NODE</code> last), the OM should publish the
+<em>final</em> ownership flip only when a shard's migration completes:
+<ul>
+<li><b>Phase A (start):</b> publish the migration task + shard labels; <code>RouteInfo</code> ownership for migrating
+shards still points at the <em>source</em>. Clients keep hitting the source.</li>
+<li><b>Phase B (commit, per shard):</b> when a shard is fully migrated, OM flips that shard's owner to the target and
+bumps <code>RouteInfo.version</code>. Clients lazily refresh on the next version mismatch.</li>
+</ul>
+</div>
+<p><b>To wire:</b> uncomment / re-implement the migration-task creation inside <code>onboardCluster</code>
+(currently disabled because only static sharding is supported), and add a real <code>removeCluster</code>.</p>
+<div class="cite">ClusterSetManager.cpp:412-433 (migration block commented out)</div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="task">2 &middot; Delivering the migration task to the OS</h2>
+<div class="panel">
+<p>A <code>MigrationTask</code> already models <em>source cluster &rarr; target cluster + the set of shards</em> with a
+globally unique id.</p>
+<div class="cite">protocols/common.proto:86-124 (Migration / MigrationTask / MigrationProgress)</div>
+
+<h3>Push vs Pull &mdash; recommendation: <b>OM pushes via StartMigration, OS reports via OnMigration</b></h3>
+<table>
+<tr><th></th><th>Push (OM &rarr; OS <code>StartMigration</code>)</th><th>Pull (OS polls OM)</th></tr>
+<tr><td>Trigger latency</td><td>Immediate</td><td>Up to one poll interval</td></tr>
+<tr><td>OM complexity</td><td>OM tracks who it told; retries on failure</td><td>OM is passive; simpler</td></tr>
+<tr><td>OS complexity</td><td>OS just serves an RPC + reports progress</td><td>OS needs a poll loop + dedupe</td></tr>
+<tr><td>Already in repo?</td><td><b>Yes</b> &mdash; <code>StartMigrationCallData</code>, <code>EndMigrationCallData</code>, <code>OnMigration</code> reporting</td><td>No</td></tr>
+</table>
+<div class="cite">RequestReceiver.cpp:81-83 (StartMigration/EndMigration registered), ObjectStore.cpp:208-243 (triggerMigration + reportMigration)</div>
+
+<div class="callout ok2">
+<b>Recommended hybrid (matches current code):</b>
+<ol>
+<li>OM <b>pushes</b> <code>StartMigration(task, RouteInfo)</code> to the <b>source</b> OS leader, and an analogous
+<code>StartMigration(IMPORTING)</code> to the <b>target</b> OS leader, so both sides arm their shard labels.</li>
+<li>Source OS runs the migrate pipeline and <b>pushes progress back</b> via <code>OnMigration</code>
+(<code>RUNNING &hellip; SUCCEEDED</code>).</li>
+<li>On <code>SUCCEEDED</code>, OM commits the route flip (Phase B) and pushes <code>EndMigration(newRouteInfo)</code> to
+both sides.</li>
+<li><b>Pull as a safety net:</b> the OS startup handshake already pulls the latest <code>RouteInfo</code> from OM, so a
+crashed/restarted OS re-discovers an in-flight task. Keep this as the recovery path.</li>
+</ol>
+</div>
+<div class="cite">ObjectStore.cpp:193-206 (refreshRouteInfo / requestRouteInfo), ObjectStore.cpp:282-301 (startup pulls global info)</div>
+
+<p><b>To wire:</b> have <code>onboardCluster</code> actually create the task (req&nbsp;1), and register a server-side
+<code>MigrateBatchCallData</code> on the <em>target</em> so it can receive exported batches &mdash; the import RPC
+handler is missing today even though <code>migrateBatchAsync()</code> exists on the engine.</p>
+<div class="cite">RequestReceiver.cpp:73-86 (no MigrateBatchCallData), KVEngineImpl.cpp:485-507 (migrateBatchAsync &rarr; importAsync)</div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="labels">3 &middot; Shard-level vs cluster-level labels &mdash; choose <u>shard-level</u></h2>
+<div class="panel">
+<p><b>Decision:</b> <code>IMPORTING</code>/<code>EXPORTING</code> must be tracked <b>per shard</b>, not per cluster.
+This is exactly Redis' per-slot model and it is necessary for availability: a cluster typically owns thousands of
+shards and only a handful move at a time &mdash; the other shards must keep serving as <code>IN_SERVICE</code>.</p>
+
+<h3>What exists today</h3>
+<table>
+<tr><th>Enum</th><th>Granularity</th><th>Used on the request path?</th></tr>
+<tr><td><code>Cluster.ClusterStatus</code> &mdash; <code>EXPORTING</code>/<code>IMPORTING</code></td><td><b>Cluster</b></td><td><b>Yes</b> &mdash; <code>preExecute</code> branches on whole-cluster status</td></tr>
+<tr><td><code>Migration.MigrationShardStatus</code> &mdash; <code>SCANNING</code>/<code>EXPORTING</code>/<code>MIGRATED</code></td><td><b>Shard</b></td><td>No &mdash; only carried in progress reports</td></tr>
+</table>
+<div class="cite">protocols/common.proto:127-133 (cluster-level), :97-104 (shard-level), ObjectStore.cpp:130-185 (preExecute reads cluster status)</div>
+
+<div class="callout danger">
+<b>Problem with the current cluster-level label:</b> when a cluster is flagged <code>EXPORTING</code>, the
+<code>preExecute</code> loop applies migration logic to <em>every</em> key, even keys whose shard is not part of the
+task. With many shards per cluster that needlessly funnels unrelated traffic through the migration path. The
+in-loop <code>checkIfInMigrationShards(shardId)</code> guard narrows behaviour, but the authoritative state still
+lives at cluster granularity.
+</div>
+
+<h3>Target model</h3>
+<ul>
+<li>Promote the label to a <b>per-shard map</b> on each OS: <code>shardId &rarr; {IN_SERVICE | EXPORTING | IMPORTING}</code>, persisted via Raft alongside the migration task.</li>
+<li><b>Cluster status becomes a derived aggregate</b> for observability only: a cluster is "migrating" iff any shard is <code>EXPORTING</code>/<code>IMPORTING</code>; it never gates per-key routing by itself.</li>
+<li><code>preExecute</code> consults the <b>shard's</b> label for the key, mirroring Redis checking the slot's
+<code>MIGRATING</code>/<code>IMPORTING</code> flag.</li>
+</ul>
+<figure>
+<svg viewBox="0 0 900 220" role="img" aria-label="Shard state machine">
+  <rect x="40" y="90" width="150" height="46" rx="8" fill="#13261a" stroke="#3fb950"/>
+  <text x="115" y="118" text-anchor="middle" class="svgtext">IN_SERVICE</text>
+  <rect x="270" y="30" width="170" height="46" rx="8" fill="#2a2410" stroke="#d29922"/>
+  <text x="355" y="58" text-anchor="middle" class="svgtext">EXPORTING (src)</text>
+  <rect x="270" y="150" width="170" height="46" rx="8" fill="#241a26" stroke="#bc8cff"/>
+  <text x="355" y="178" text-anchor="middle" class="svgtext">IMPORTING (dst)</text>
+  <rect x="540" y="90" width="200" height="46" rx="8" fill="#13261a" stroke="#3fb950"/>
+  <text x="640" y="118" text-anchor="middle" class="svgtext">IN_SERVICE (new owner)</text>
+  <line x1="190" y1="105" x2="270" y2="60" stroke="#d29922" stroke-width="1.5" marker-end="url(#b)"/>
+  <text x="225" y="72" text-anchor="middle" class="svgsmall">StartMigration</text>
+  <line x1="190" y1="120" x2="270" y2="168" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#b)"/>
+  <line x1="440" y1="55" x2="540" y2="105" stroke="#3fb950" stroke-width="1.5" marker-end="url(#b)"/>
+  <text x="500" y="70" text-anchor="middle" class="svgsmall">all keys migrated</text>
+  <line x1="440" y1="172" x2="540" y2="120" stroke="#3fb950" stroke-width="1.5" marker-end="url(#b)"/>
+  <text x="500" y="165" text-anchor="middle" class="svgsmall">EndMigration + route flip</text>
+  <defs><marker id="b" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/></marker></defs>
+</svg>
+<figcaption>Per-shard state machine. Source shard: IN_SERVICE&rarr;EXPORTING&rarr;(handed off). Target shard: IN_SERVICE&rarr;IMPORTING&rarr;IN_SERVICE(owner).</figcaption>
+</figure>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="redirect">4 &middot; Source-anchored read/write &amp; the MIGRATED_ROUTE redirect</h2>
+<div class="panel">
+<p>Per requirement&nbsp;4, while a shard is migrating the client <b>always sends to the source first</b>. The source decides per key:</p>
+<table>
+<tr><th>Source sees (for a key in an EXPORTING shard)</th><th>Action</th><th>Client</th><th>Redis analogue</th></tr>
+<tr><td>Key still present (not yet migrated)</td><td>Serve read/write locally</td><td>Normal latency</td><td>slot MIGRATING, key present &rarr; serve</td></tr>
+<tr><td>Key absent (already migrated &amp; deleted)</td><td>Return <code>MIGRATED_ROUTE</code> + <code>routeHint=target</code></td><td>Retry against target once</td><td><code>ASK</code> redirect</td></tr>
+<tr><td>Whole shard no longer owned + client stale</td><td><code>WRONG_ROUTE</code>/<code>CLIENT_ROUTE_OUT_OF_DATE</code></td><td>Refresh RouteInfo from OM, retry</td><td><code>MOVED</code> redirect</td></tr>
+</table>
+<div class="cite">ObjectStore.cpp:159-185 (EXPORTING branch &rarr; readMeta NotFound &rarr; migratedRoute), :120-128 (version handshake), protocols/common.proto:22-31 (response codes)</div>
+
+<div class="callout">
+<b>Target side (IMPORTING):</b> the target accepts a read/write for a shard it is importing (the migration-set
+check) &mdash; equivalent to Redis requiring the <code>ASKING</code> flag before serving an importing slot. A
+client redirected by <code>MIGRATED_ROUTE</code> is, in effect, "asking."
+<div class="cite">ObjectStore.cpp:160-166 (IMPORTING accepts migrating shard)</div>
+</div>
+
+<h3>The correctness gap this design must close</h3>
+<div class="callout danger">
+Today "already migrated" is inferred purely from <b>physical absence</b> (<code>readMeta</code> returns NotFound),
+because <code>deleteKV</code> is a hard RocksDB delete with no per-shard "sealed" marker. That cannot distinguish
+<em>migrated</em> from <em>never-existed</em> (both redirect to the target, which is acceptable), but more
+importantly it cannot stop a <em>new write</em> from re-creating an already-exported key on the source, nor
+guarantee the export of value <code>v1</code> is ordered before a redirected write of <code>v2</code> on the target.
+Because <code>writeKV</code> is blind last-writer-wins and import <em>restores the source's (older) version</em>, a
+late-arriving import can silently clobber a newer live write.
+<div class="cite">RocksDBKVStore.cpp:290-308 (blind writeKV), :374-388 (hard deleteKV), CommandProcessor.cpp:264-293 + VersionStore.cpp:24-37 (import preserves source version)</div>
+</div>
+<p>Requirement&nbsp;5 (the atomic <code>Migrate</code> command + per-key lock) is precisely the fix.</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="migcmd">5 &middot; The atomic <code>Migrate</code> command (per-key lock across export + delete)</h2>
+<div class="panel">
+<p>Model this on Redis' atomic <code>MIGRATE</code>: for one key (or a batch within a shard) the source performs
+<em>export-to-target then delete-locally</em> as a <b>single command that holds the key's exclusive lock for the whole
+duration</b>. Any concurrent operation on the same key serializes behind that lock, so it observes either
+"pre-migration on source" or "post-migration &rarr; <code>MIGRATED_ROUTE</code>", never a torn intermediate.</p>
+
+<h3>Reuse the existing lock machinery</h3>
+<p>Goblin already has per-key exclusive/shared locking used by writes, and the current import command already takes an
+exclusive lock. The <code>Migrate</code> command extends the lock's scope to cover export <b>and</b> delete:</p>
+<div class="cite">store/KVStore.h:66-83 (lock/unlock API), KVImportCommand.cpp:31-34 + :76-86 (exclusive lock in prepare, unlock in finish)</div>
+
+<figure>
+<svg viewBox="0 0 980 300" role="img" aria-label="Migrate command sequence">
+  <text x="90" y="24" text-anchor="middle" class="svgtext">Source OS</text>
+  <text x="500" y="24" text-anchor="middle" class="svgtext">Migrate cmd (holds key lock)</text>
+  <text x="890" y="24" text-anchor="middle" class="svgtext">Target OS</text>
+  <line x1="90" y1="40" x2="90" y2="280" stroke="#2d3742"/>
+  <line x1="500" y1="40" x2="500" y2="280" stroke="#2d3742"/>
+  <line x1="890" y1="40" x2="890" y2="280" stroke="#2d3742"/>
+  <!-- lock -->
+  <rect x="480" y="55" width="40" height="200" rx="5" fill="rgba(210,153,34,.18)" stroke="#d29922"/>
+  <text x="500" y="50" text-anchor="middle" class="svgsmall">LOCK</text>
+  <line x1="90" y1="75" x2="500" y2="75" stroke="#4f9cff" stroke-width="1.5" marker-end="url(#c)"/>
+  <text x="295" y="68" text-anchor="middle" class="svgsmall">1. acquire exclusive lock(key)</text>
+  <line x1="500" y1="115" x2="890" y2="115" stroke="#bc8cff" stroke-width="1.5" marker-end="url(#c)"/>
+  <text x="695" y="108" text-anchor="middle" class="svgsmall">2. MigrateBatch (export value+version+ttl)</text>
+  <line x1="890" y1="155" x2="500" y2="155" stroke="#3fb950" stroke-width="1.5" marker-end="url(#c)"/>
+  <text x="695" y="148" text-anchor="middle" class="svgsmall">3. OK (import committed via target Raft)</text>
+  <line x1="500" y1="195" x2="90" y2="195" stroke="#f85149" stroke-width="1.5" marker-end="url(#c)"/>
+  <text x="295" y="188" text-anchor="middle" class="svgsmall">4. delete(key) locally (only after 3 OK)</text>
+  <line x1="90" y1="235" x2="500" y2="235" stroke="#9aa7b4" stroke-width="1.5" marker-end="url(#c)"/>
+  <text x="295" y="228" text-anchor="middle" class="svgsmall">5. release lock &rarr; later ops see absent &rarr; MIGRATED_ROUTE</text>
+  <defs><marker id="c" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+    <path d="M0,0 L7,3 L0,6 Z" fill="#9aa7b4"/></marker></defs>
+</svg>
+<figcaption>The lock spans steps 2&ndash;4. Concurrent writers to the same key block at step 1 and resume at step 5,
+where the key is already gone &rarr; they get MIGRATED_ROUTE to the target.</figcaption>
+</figure>
+
+<h3>Ordering &amp; idempotency rules</h3>
+<ul>
+<li><b>Export before delete, delete only on success.</b> The source deletes locally <em>only after</em> the target
+confirms the import is committed (target Raft). If the target ack is lost, retry the export &mdash; import is
+idempotent because it is keyed and version-preserving.</li>
+<li><b>Version-monotone import.</b> Import keeps the source's original version so a client that read version
+<code>v</code> can still CAS on the target. Combined with the lock, a live write that beats the migrate either (a)
+happens entirely before the lock &rarr; its newer value is what gets exported, or (b) blocks until after delete &rarr;
+it is redirected to the target and applied there with a higher version. No regression either way.
+<div class="cite">CommandProcessor.cpp:264-293 (expectedVersion = importedVersion)</div></li>
+<li><b>Seal-on-export.</b> While the key is locked/migrating the source must <em>refuse to re-create</em> it via a
+normal write; such writes are redirected (<code>MIGRATED_ROUTE</code>) rather than served. This is the per-shard
+"sealed" guarantee that pure presence-checking lacks today.</li>
+</ul>
+
+<div class="callout warn">
+<b>Granularity tradeoff.</b> Locking one key at a time is simplest and lowest-impact but chatty for huge shards.
+A batched <code>Migrate</code> (lock a small key-range / scan batch, export the batch, delete the batch, unlock)
+amortizes the round-trips &mdash; analogous to Redis <code>MIGRATE ... KEYS k1 k2 &hellip;</code>. Keep batches small so
+unrelated keys in the shard stay available.
+</div>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="flow">End-to-end flow (scale-out: add cluster B)</h2>
+<div class="panel">
+<ol>
+<li><span class="step">1</span><b>Admin &rarr; OM <code>addCluster(B)</code>.</b> Ring recomputed; shards <code>S</code> move A&rarr;B. OM creates a <code>MigrationTask(A&rarr;B, S)</code>, marks those shards <code>EXPORTING</code>(A)/<code>IMPORTING</code>(B), bumps <code>RouteInfo.version</code> but keeps ownership of <code>S</code> on A (Phase A).</li>
+<li><span class="step">2</span><b>OM &rarr; <code>StartMigration</code></b> to A (source) and B (target). Both arm per-shard labels for <code>S</code>.</li>
+<li><span class="step">3</span><b>A runs the <code>Migrate</code> pipeline</b> shard-by-shard, key/batch at a time, each under the per-key lock: export to B &rarr; B commits via Raft &rarr; A deletes locally.</li>
+<li><span class="step">4</span><b>Live traffic stays available.</b> Clients hit A; present keys served by A, migrated keys &rarr; <code>MIGRATED_ROUTE</code> &rarr; retry B; B accepts them (IMPORTING).</li>
+<li><span class="step">5</span><b>A &rarr; OM <code>OnMigration</code></b> progress until shard <code>S</code> is <code>MIGRATED</code> (<code>SUCCEEDED</code>).</li>
+<li><span class="step">6</span><b>OM commits Phase B:</b> flip ownership of <code>S</code> to B, bump <code>RouteInfo.version</code>, push <code>EndMigration(newRouteInfo)</code> to A and B; both clear the shard labels (B&rarr;<code>IN_SERVICE</code> owner).</li>
+<li><span class="step">7</span><b>Clients</b> notice the version bump on their next request and lazily refresh, now routing <code>S</code> straight to B (<code>MOVED</code>-style).</li>
+</ol>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="proto">Proto &amp; API touch-points</h2>
+<div class="panel">
+<table>
+<tr><th>Area</th><th>Change</th><th>Where</th></tr>
+<tr><td>Response codes</td><td>Reuse <code>WRONG_ROUTE</code>, <code>MIGRATED_ROUTE</code>, <code>CLIENT/SERVER_ROUTE_OUT_OF_DATE</code> as-is</td><td>protocols/common.proto:22-31</td></tr>
+<tr><td>Shard label</td><td>Persist a per-shard <code>{IN_SERVICE|EXPORTING|IMPORTING}</code> map on each OS; demote cluster status to derived/aggregate</td><td>common.proto:97-104 vs :127-133</td></tr>
+<tr><td>Migration task delivery</td><td>Wire <code>onboardCluster</code> to create tasks; push via existing <code>StartMigration</code></td><td>ClusterSetManager.cpp:412-433; RequestReceiver.cpp:81-83</td></tr>
+<tr><td>Import RPC</td><td>Add server-side <code>MigrateBatchCallData</code> on the target (handler missing)</td><td>RequestReceiver.cpp:73-86; KVEngineImpl.cpp:485-507</td></tr>
+<tr><td>Atomic migrate</td><td>New <code>Migrate</code> command holding key lock across export+delete; seal-on-export</td><td>KVStore.h:66-83; model/ (new), cf. KVImportCommand.cpp</td></tr>
+<tr><td>Route commit</td><td>Per-shard ownership flip on <code>SUCCEEDED</code> + version bump (Phase B)</td><td>ClusterSetManager.cpp (fillRouteInfo / EndMigration)</td></tr>
+</table>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="plan">Implementation work plan</h2>
+<div class="panel">
+<table>
+<tr><th>#</th><th>Item</th><th>Status</th></tr>
+<tr><td>1</td><td>Re-enable migration-task creation in <code>onboardCluster</code>; implement <code>removeCluster</code></td><td><span class="tag partial">PARTIAL</span></td></tr>
+<tr><td>2</td><td>Two-phase route: keep migrating-shard ownership on source until commit; flip per shard on success</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>3</td><td>Per-shard <code>EXPORTING</code>/<code>IMPORTING</code> label map (Raft-persisted); make <code>preExecute</code> consult shard label</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>4</td><td>Register <code>MigrateBatchCallData</code> on the target so imports are served</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>5</td><td>Atomic <code>Migrate</code> command: exclusive lock spanning export+delete; seal-on-export; idempotent retry</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>6</td><td>Migration failure/rollback &amp; resume path; persist <code>PREPARED</code>/<code>RUNNING</code> task states</td><td><span class="tag todo">NEW</span></td></tr>
+<tr><td>7</td><td>Bound the export retry loop; remove <code>assert()</code>-on-mismatch fragility in <code>MigrationManager</code></td><td><span class="tag partial">PARTIAL</span></td></tr>
+</table>
+<p class="muted">Items reuse the existing StartMigration/EndMigration/OnMigration RPCs, the MigrationManager scan pipeline,
+the version-preserving import, and the per-key lock &mdash; so the bulk of v2 is wiring + the atomic
+<code>Migrate</code> command + shard-level labels, rather than green-field work.</p>
+</div>
+
+</div>
+</body>
+</html>
