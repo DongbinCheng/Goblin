@@ -366,6 +366,11 @@
           <li>Delete local copy of K.</li>
           <li>Release lock once the command passes CPL. Command is persisted, so it resumes after restart.</li>
         </ol>
+        <p class="muted" style="margin-top:10px;border-left:3px solid var(--accent);padding-left:10px">
+          <b>Key point — order is everything:</b> the local delete only happens <i>after</i> the target acks the
+          <code>MigrateBatch</code>. Because CPL runs ahead of EAL, a source read that finds the key absent must wait not
+          just for <b>commit</b> but for <b>EAL apply</b> before replying <code>MIGRATED_ROUTE</code> — guaranteeing the
+          key is already persisted at the target and never falls into a "nowhere" gap. See R10.</p>
       </div>
       <div class="card">
         <h4>Why it's safe</h4>
@@ -507,6 +512,27 @@
       (absent → <code>MIGRATED_ROUTE</code> → target), so clients always observe the latest value and never a stale
       migrated copy.</p>
     </div>
+
+    <div class="card" style="border-left:4px solid var(--ok);background:rgba(61,220,151,.06)">
+      <h4 style="color:var(--ok)">R10. Cross-cluster CPL/EAL skew — resolved (version-aware reads: commit-wait for hits, commit+apply-wait for redirect) <span class="sev lo">Resolved</span></h4>
+      <p class="muted">Goblin's <b>CPL (in-memory state machine) runs ahead of EAL (RocksDB apply)</b>. A migrated key is deleted
+      in source CPL the moment its MigrationCommand passes CPL, but the local delete is not yet persisted in RocksDB, and EAL
+      may not have reached it. Naively, a read could miss the key in source CPL, get <code>MIGRATED_ROUTE</code>, retry the
+      target, and find it not yet imported there either — a brief <b>"nowhere"</b> window. Resolved by making source reads
+      <b>version-aware</b>, exploiting that export order is always <i>MigrateBatch (target acks) → local delete</i>:</p>
+      <ul>
+        <li><b>Normal hit → wait for commit only.</b> The value the read sees in CPL is replied once that version is
+        committed by a Raft majority — i.e. the data is durable. Cheap, no apply-wait.</li>
+        <li><b>Absent → MIGRATED_ROUTE → wait for commit <i>and</i> EAL apply.</b> The redirect is held until EAL has
+        applied up to the read's commit index, so <b>every delete the source could redirect for is persisted</b>, which
+        means each such key was already MigrateBatch-acked at the target. The redirect therefore only leaves once the key
+        is guaranteed present at the target — the nowhere window collapses by construction, with <b>no per-key
+        tombstone</b> and no extra storage.</li>
+      </ul>
+      <p class="muted">The apply-wait is bounded by "EAL caught up to current commit index," so genuinely-absent keys and
+      non-migrating shards pay at most one extra round-trip, not a migration-long stall. Builds on R3 (delete is part of the
+      persisted command, so apply truly implies target-acked) and R7 (insert-if-absent keeps the import idempotent).</p>
+    </div>
   </section>
 
   <section>
@@ -524,7 +550,10 @@
     written during EAL lag win over a lagging migrated copy (R6, R7, R9 resolved). Finally, leader churn on the OM
     migration driver is safe (R8 resolved): a <code>ShardMigrationTask</code> can be triggered by one leader and completed
     under another because all task state is in OM's Raft log, and double-driving is prevented by making the task
-    <b>idempotent</b> and having the <b>OS reject a second <code>ShardMigrationTask</code> for a shard already migrating</b>.</p>
+    <b>idempotent</b> and having the <b>OS reject a second <code>ShardMigrationTask</code> for a shard already migrating</b>.
+    The cross-cluster CPL/EAL skew is closed (R10 resolved) by <b>version-aware reads</b>: a hit waits only for commit, but
+    an absent-key <code>MIGRATED_ROUTE</code> waits for commit <b>and</b> EAL apply, so the source only redirects once every
+    migrated delete is persisted and the key is guaranteed present at the target — no per-key tombstone, no extra storage.</p>
   </section>
 </main>
 
