@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Summary — Goblin Dynamic Sharding</title>
+<link rel="stylesheet" href="slides.css">
+</head>
+<body>
+<main>
+  <section>
+    <h2><span class="num">✓</span>Summary</h2>
+    <p>Dynamic sharding moves shards one-at-a-time per cluster, keeps reads/writes anchored to the source until a key
+    actually moves, and flips the route version only once a shard is fully migrated. Persisting every state change into
+    Raft is what makes it resumable across leader changes. Following the Redis-style decision, there is <b>no per-key
+    "moved" marker</b>: absence at the source always means "redirect to target" (<code>MIGRATED_ROUTE</code>), which
+    cleanly handles both migrated and brand-new keys (R1, R2 resolved). Cross-cluster atomicity (R3) is handled by
+    <b>replaying the persisted MigrationCommand until both the target ack and the local delete succeed</b>, reconciling
+    any crash-window duplicate to target-only. EAL blocking does not hurt availability (R4): clients are replied once
+    entries are committed to the Raft log by a majority, independent of EAL apply. Cluster membership changes are
+    persisted to OM's Raft log so teardown is safely sequenced (R5), and <code>MigrateBatch</code> is
+    <b>insert-if-absent</b> — it writes a key only if absent — which makes it idempotent and lets a newer client value
+    written during EAL lag win over a lagging migrated copy (R6, R7, R9 resolved). Finally, leader churn on the OM
+    migration driver is safe (R8 resolved): a <code>ShardMigrationTask</code> can be triggered by one leader and completed
+    under another because all task state is in OM's Raft log, and double-driving is prevented by making the task
+    <b>idempotent</b> and having the <b>OS reject a second <code>ShardMigrationTask</code> for a shard already migrating</b>.
+    The cross-cluster CPL/EAL skew is closed (R10 resolved) by <b>version-aware reads</b>: a hit waits only for commit, but
+    an absent-key <code>MIGRATED_ROUTE</code> waits for commit <b>and</b> EAL apply, so the source only redirects once every
+    migrated delete is persisted and the key is guaranteed present at the target — no per-key tombstone, no extra storage.</p>
+  </section>
+</main>
+<nav class="nav">
+  <a rel="prev" href="08-risks.html">← Prev</a>
+  <span class="pos">9 / 9</span>
+  <a class="disabled" rel="next" href="#">Next →</a>
+</nav>
+<footer>Goblin Dynamic Sharding · end of deck · <a href="index.html">back to index</a></footer>
+<script src="slides.js"></script>
+</body>
+</html>

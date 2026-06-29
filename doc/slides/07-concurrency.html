@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>7. Concurrency &amp; Idempotency Rules — Goblin Dynamic Sharding</title>
+<link rel="stylesheet" href="slides.css">
+</head>
+<body>
+<main>
+  <section id="concurrency">
+    <h2><span class="num">7</span>Concurrency &amp; Idempotency Rules</h2>
+    <table>
+      <tr><th>Rule</th><th>Rationale</th></tr>
+      <tr><td>OM may run shard migrations for <b>different</b> OS clusters concurrently.</td><td>Maximize throughput across the fleet.</td></tr>
+      <tr><td>Only <b>one</b> shard migration at a time <b>per</b> OS cluster.</td><td>MigrationCommand's R/W lock would otherwise hurt serving latency.</td></tr>
+      <tr><td>All RPCs (StartMigration, MigrateBatch, OnMigration, EndMigration) idempotent.</td><td>Responses may be lost; retries must be safe.</td></tr>
+      <tr><td>OM exposes a migration-status gRPC (queried by admin/erdapel).</td><td>Observability: how many shards migrated so far.</td></tr>
+    </table>
+  </section>
+</main>
+<nav class="nav">
+  <a rel="prev" href="06-migration-command.html">← Prev</a>
+  <span class="pos">7 / 9</span>
+  <a rel="next" href="08-risks.html">Next →</a>
+</nav>
+<script src="slides.js"></script>
+</body>
+</html>

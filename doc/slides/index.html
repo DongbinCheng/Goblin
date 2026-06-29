@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Goblin Dynamic Sharding — Demo Index</title>
+<link rel="stylesheet" href="slides.css">
+</head>
+<body>
+<header>
+  <h1>🧩 Goblin Dynamic Sharding</h1>
+  <p>How a Goblin OS (Object Store) cluster set scales <b>horizontally</b> by migrating shards between
+  clusters — with zero data loss and uninterrupted availability. Demo these pages one at a time;
+  use the Next/Prev buttons or the ← → arrow keys.</p>
+</header>
+<main>
+  <section class="toc">
+    <h2><span class="num">＃</span>Contents</h2>
+    <div class="grid cols-3">
+      <div>1. <a href="01-big-picture.html">The Big Picture</a></div>
+      <div>2. <a href="02-route-info.html">Route Info &amp; Versioning</a></div>
+      <div>3. <a href="03-migration-flow.html">End-to-End Migration Flow</a></div>
+      <div>4. <a href="04-state-machine.html">Per-Shard State Machine</a></div>
+      <div>5. <a href="05-reads-writes.html">Source-Anchored Reads/Writes</a></div>
+      <div>6. <a href="06-migration-command.html">The Atomic MigrationCommand</a></div>
+      <div>7. <a href="07-concurrency.html">Concurrency &amp; Idempotency</a></div>
+      <div>8. <a href="08-risks.html">⚠️ Risks &amp; Concerns</a></div>
+      <div>9. <a href="09-summary.html">Summary</a></div>
+    </div>
+  </section>
+</main>
+<nav class="nav">
+  <a class="disabled" rel="prev" href="#">← Prev</a>
+  <span class="pos">Index</span>
+  <a rel="next" href="01-big-picture.html">Next →</a>
+</nav>
+<footer>Goblin Dynamic Sharding · demo deck · open <code>doc/slides/index.html</code></footer>
+<script src="slides.js"></script>
+</body>
+</html>

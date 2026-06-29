@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>2. Route Info &amp; Version Reconciliation — Goblin Dynamic Sharding</title>
+<link rel="stylesheet" href="slides.css">
+</head>
+<body>
+<main>
+  <section id="route">
+    <h2><span class="num">2</span>Route Info &amp; Version Reconciliation</h2>
+    <p>Every key → one of <b>4096 shards</b> by consistent hashing. RouteInfo maps <code>shardId → clusterId</code>
+    plus the UDNS of each partition. A monotonically increasing <b>route version</b> keeps everyone in sync.</p>
+    <div class="svgwrap">
+      <svg viewBox="0 0 920 250" role="img" aria-label="Route version reconciliation">
+        <rect x="40" y="40" width="160" height="70" rx="10" fill="#3a3320" stroke="var(--cli)"/>
+        <text x="120" y="70" fill="var(--cli)" font-size="14" text-anchor="middle">Client req</text>
+        <text x="120" y="90" fill="var(--muted)" font-size="12" text-anchor="middle">routeVer = v</text>
+
+        <rect x="380" y="40" width="180" height="70" rx="10" fill="#2a2030" stroke="var(--src)"/>
+        <text x="470" y="70" fill="var(--src)" font-size="14" text-anchor="middle">OS server</text>
+        <text x="470" y="90" fill="var(--muted)" font-size="12" text-anchor="middle">routeVer = V</text>
+
+        <rect x="720" y="40" width="160" height="70" rx="10" fill="#262a55" stroke="var(--om)"/>
+        <text x="800" y="78" fill="var(--om)" font-size="14" text-anchor="middle">OneOM</text>
+
+        <line x1="200" y1="75" x2="378" y2="75" stroke="var(--accent)" stroke-width="2" marker-end="url(#a2)"/>
+
+        <text x="120" y="160" fill="var(--warn)" font-size="13" text-anchor="middle">v &lt; V →</text>
+        <text x="120" y="180" fill="var(--muted)" font-size="12" text-anchor="middle">CLIENT_ROUTE_OUT_OF_DATE</text>
+        <text x="120" y="198" fill="var(--muted)" font-size="11" text-anchor="middle">client refreshes from OM</text>
+
+        <text x="470" y="160" fill="var(--warn)" font-size="13" text-anchor="middle">v &gt; V →</text>
+        <text x="470" y="180" fill="var(--muted)" font-size="12" text-anchor="middle">SERVER_ROUTE_OUT_OF_DATE</text>
+        <text x="470" y="198" fill="var(--muted)" font-size="11" text-anchor="middle">server refreshes from OM</text>
+
+        <text x="800" y="160" fill="var(--ok)" font-size="13" text-anchor="middle">v == V →</text>
+        <text x="800" y="180" fill="var(--muted)" font-size="12" text-anchor="middle">serve normally</text>
+
+        <line x1="800" y1="110" x2="560" y2="140" stroke="var(--om)" stroke-width="1.5" stroke-dasharray="4" marker-end="url(#a2)"/>
+        <line x1="720" y1="90" x2="200" y2="120" stroke="var(--om)" stroke-width="1.5" stroke-dasharray="4" marker-end="url(#a2)"/>
+        <defs><marker id="a2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)"/></marker></defs>
+      </svg>
+    </div>
+    <p class="muted">OM bumps the version when pods are added/removed in a partition (vertical) or when a cluster is
+    added/removed (horizontal). An OS leader refreshes RouteInfo in <code>onBecomeLeader</code> before serving traffic.</p>
+  </section>
+</main>
+<nav class="nav">
+  <a rel="prev" href="01-big-picture.html">← Prev</a>
+  <span class="pos">2 / 9</span>
+  <a rel="next" href="03-migration-flow.html">Next →</a>
+</nav>
+<script src="slides.js"></script>
+</body>
+</html>

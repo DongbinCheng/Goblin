@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3. End-to-End Migration Flow — Goblin Dynamic Sharding</title>
+<link rel="stylesheet" href="slides.css">
+</head>
+<body>
+<main>
+  <section id="flow">
+    <h2><span class="num">3</span>End-to-End Migration Flow</h2>
+    <p>A single shard's journey from source to target. Every step is persisted in a Raft log, so a leader change
+    or rollout simply resumes from the last committed point.</p>
+    <div class="svgwrap">
+      <svg viewBox="0 0 920 470" role="img" aria-label="Migration sequence">
+        <!-- lifelines -->
+        <text x="110" y="28" fill="#fff" font-size="13" text-anchor="middle" font-weight="700">Admin</text>
+        <text x="320" y="28" fill="var(--om)" font-size="13" text-anchor="middle" font-weight="700">OneOM (leader)</text>
+        <text x="560" y="28" fill="var(--src)" font-size="13" text-anchor="middle" font-weight="700">Source cluster</text>
+        <text x="810" y="28" fill="var(--tgt)" font-size="13" text-anchor="middle" font-weight="700">Target cluster</text>
+        <line x1="110" y1="38" x2="110" y2="450" stroke="var(--line)"/>
+        <line x1="320" y1="38" x2="320" y2="450" stroke="var(--line)"/>
+        <line x1="560" y1="38" x2="560" y2="450" stroke="var(--line)"/>
+        <line x1="810" y1="38" x2="810" y2="450" stroke="var(--line)"/>
+
+        <!-- messages -->
+        <g font-size="11" fill="var(--muted)">
+          <line x1="110" y1="65" x2="318" y2="65" stroke="var(--accent)" stroke-width="2" marker-end="url(#a3)"/>
+          <text x="200" y="58">addCluster → recompute ring, record task</text>
+
+          <line x1="320" y1="105" x2="558" y2="105" stroke="var(--accent)" stroke-width="2" marker-end="url(#a3)"/>
+          <text x="430" y="98">StartMigration</text>
+          <line x1="320" y1="125" x2="808" y2="125" stroke="var(--accent)" stroke-width="2" marker-end="url(#a3)"/>
+          <text x="560" y="118">StartMigration</text>
+
+          <line x1="560" y1="165" x2="560" y2="165" stroke="var(--src)"/>
+          <rect x="500" y="150" width="120" height="22" rx="4" fill="#2a2030" stroke="var(--src)"/>
+          <text x="560" y="165" fill="var(--src)" text-anchor="middle">label EXPORTING</text>
+          <rect x="750" y="150" width="120" height="22" rx="4" fill="#1d2e33" stroke="var(--tgt)"/>
+          <text x="810" y="165" fill="var(--tgt)" text-anchor="middle">label IMPORTING</text>
+
+          <rect x="470" y="195" width="180" height="22" rx="4" fill="#23284a" stroke="var(--line)"/>
+          <text x="560" y="210" text-anchor="middle">generate MigrationCommands</text>
+
+          <line x1="560" y1="250" x2="808" y2="250" stroke="var(--ok)" stroke-width="2.5" marker-end="url(#a3ok)"/>
+          <text x="685" y="243" fill="var(--ok)">MigrateBatch (per command, atomic)</text>
+          <line x1="808" y1="275" x2="562" y2="275" stroke="var(--ok)" stroke-width="1.5" stroke-dasharray="4" marker-end="url(#a3ok)"/>
+          <text x="685" y="290" fill="var(--muted)">ack → delete local data</text>
+
+          <text x="560" y="318" fill="var(--muted)" text-anchor="middle">…repeat for every key in shard…</text>
+
+          <line x1="560" y1="350" x2="322" y2="350" stroke="var(--accent)" stroke-width="2" marker-end="url(#a3)"/>
+          <text x="440" y="343">OnMigration (shard done)</text>
+
+          <rect x="250" y="365" width="140" height="22" rx="4" fill="#262a55" stroke="var(--om)"/>
+          <text x="320" y="380" fill="var(--om)" text-anchor="middle">bump route version</text>
+
+          <line x1="320" y1="410" x2="558" y2="410" stroke="var(--accent)" stroke-width="2" marker-end="url(#a3)"/>
+          <text x="430" y="403">EndMigration (new route)</text>
+          <line x1="320" y1="430" x2="808" y2="430" stroke="var(--accent)" stroke-width="2" marker-end="url(#a3)"/>
+          <text x="560" y="423">EndMigration → drop IMPORTING/EXPORTING</text>
+        </g>
+        <defs>
+          <marker id="a3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)"/></marker>
+          <marker id="a3ok" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--ok)"/></marker>
+        </defs>
+      </svg>
+    </div>
+    <ol class="flow">
+      <li><b>Admin-driven route change.</b> <code>addCluster</code>/<code>removeCluster</code> recomputes the ring; OM records the migration task into its Raft log &amp; state machine so it survives leader change.</li>
+      <li><b>Per-shard task setup.</b> The OM migration-task consumer (leader only) sends <code>StartMigration</code> to source &amp; target; each persists a ShardMigration task and labels the shard <span class="pill exp">EXPORTING</span> / <span class="pill imp">IMPORTING</span>.</li>
+      <li><b>Background commands.</b> Once the ShardMigration task commits, the source generates many <code>MigrationCommands</code> to move every key.</li>
+      <li><b>Atomic move.</b> Each command sends a <code>MigrateBatch</code> to target, waits for ack, then deletes local data — atomically under a per-key lock.</li>
+      <li><b>Finish &amp; version bump.</b> Source sends <code>OnMigration</code> to OM; OM bumps the version and sends <code>EndMigration</code> with the new route; both clusters drop the IMPORTING/EXPORTING labels.</li>
+    </ol>
+  </section>
+</main>
+<nav class="nav">
+  <a rel="prev" href="02-route-info.html">← Prev</a>
+  <span class="pos">3 / 9</span>
+  <a rel="next" href="04-state-machine.html">Next →</a>
+</nav>
+<script src="slides.js"></script>
+</body>
+</html>
