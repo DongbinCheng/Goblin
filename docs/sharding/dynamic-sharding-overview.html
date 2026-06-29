@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Goblin Sharding &amp; Dynamic Re-sharding Overview</title>
+<style>
+  :root{ --bg:#0f1420; --card:#19202e; --ink:#e7ecf3; --muted:#9fb0c3;
+         --accent:#4cc2ff; --c1:#ff8a65; --c2:#4caf50; --c3:#ba68c8; --c4:#ffd54f; --line:#2c3850; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:32px 24px;background:linear-gradient(135deg,#16243a,#0f1420);border-bottom:1px solid var(--line)}
+  h1{margin:0 0 6px;font-size:28px}
+  .sub{color:var(--muted)}
+  main{max-width:1040px;margin:0 auto;padding:24px}
+  section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px 24px;margin:20px 0}
+  h2{margin-top:0;color:var(--accent);font-size:21px;border-bottom:1px solid var(--line);padding-bottom:8px}
+  h3{color:#cfe3ff}
+  code{background:#0c111b;padding:2px 6px;border-radius:5px;color:#9ee6ff;font-size:14px}
+  pre{background:#0c111b;padding:14px;border-radius:8px;overflow:auto;border:1px solid var(--line)}
+  table{border-collapse:collapse;width:100%;margin:12px 0}
+  th,td{border:1px solid var(--line);padding:8px 10px;text-align:center}
+  th{background:#0c111b;color:var(--accent)}
+  .muted{color:var(--muted)}
+  .pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:13px}
+  .legend span{margin-right:16px;font-size:14px}
+  .dot{display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:5px;vertical-align:middle}
+  .note{border-left:4px solid var(--c4);padding:8px 14px;background:#1d2436;border-radius:6px}
+  svg{max-width:100%;height:auto;background:#0c111b;border-radius:10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Goblin Sharding &amp; Dynamic Re-sharding</h1>
+  <div class="sub">How 4096 shards map to clusters, how mapping shifts when clusters are added/removed, and how much data migrates.</div>
+</header>
+<main>
+
+<section>
+  <h2>1. The big picture: 4096 fixed shards</h2>
+  <p>Every key in Goblin is hashed into one of <b>4096 fixed shards</b>. Shards are the unit of placement &mdash; clusters come and go, but the shard count never changes.</p>
+  <pre>key ──simpleHash──&gt; shardId = hash &amp; (2^12 - 1)   // 0 .. 4095   (4096 shards)
+shardId ─────────&gt; columnFamily = shardId &amp; ((1&lt;&lt;factor)-1)   // local sub-split</pre>
+  <ul>
+    <li><b>OM (Object Manager)</b> owns the <code>shard → cluster</code> map, built by a consistent-hash <code>HashRing</code> of length 4096.</li>
+    <li><b>OS (Object Store)</b> routes each key with <code>keyToShardId</code> and picks a local column family from the shard id.</li>
+  </ul>
+  <div class="muted">Source: <code>object-store/ObjectStore.h</code> (keyToShardId :130, columnFamily :78), <code>route/HashRing.h</code> (RING_LENGTH=4096 :52), <code>protocols/common.proto</code> (Shard.DEFAULT=12).</div>
+</section>
+
+<section>
+  <h2>2. How shards are divided into clusters (the ring)</h2>
+  <p>Each cluster is placed at <code>VIRTUAL_NODE_COUNT</code> point(s) on the 0..4095 ring: <code>point = hash(clusterId#i) % 4096</code> (collisions probe forward). A cluster <b>owns every shard from its point up to the next cluster's point</b>, wrapping around. This is classic consistent hashing.</p>
+  <svg viewBox="0 0 760 320" role="img" aria-label="Ring of 4096 shards split into 3 arcs">
+    <circle cx="220" cy="160" r="120" fill="none" stroke="#2c3850" stroke-width="26"/>
+    <!-- arcs: 3 clusters -->
+    <path d="M220 40 A120 120 0 0 1 324 220" fill="none" stroke="#ff8a65" stroke-width="26"/>
+    <path d="M324 220 A120 120 0 0 1 116 220" fill="none" stroke="#4caf50" stroke-width="26"/>
+    <path d="M116 220 A120 120 0 0 1 220 40" fill="none" stroke="#ba68c8" stroke-width="26"/>
+    <circle cx="220" cy="40" r="7" fill="#fff"/><circle cx="324" cy="220" r="7" fill="#fff"/><circle cx="116" cy="220" r="7" fill="#fff"/>
+    <text x="220" y="22" fill="#9fb0c3" text-anchor="middle">shard 0/4095</text>
+    <text x="350" y="225" fill="#9fb0c3">~1365</text>
+    <text x="60" y="225" fill="#9fb0c3">~2730</text>
+    <text x="200" y="165" fill="#e7ecf3" text-anchor="middle">A: 0–1364</text>
+    <text x="220" y="245" fill="#e7ecf3" text-anchor="middle">B: 1365–2729</text>
+    <text x="200" y="120" fill="#e7ecf3" text-anchor="middle">C: 2730–4095</text>
+    <text x="540" y="60" fill="#cfe3ff" font-size="16">3 clusters ≈ 4096/3 ≈ 1365 shards each</text>
+    <text x="540" y="92" fill="#9fb0c3" font-size="13">Each arc = one cluster's shard range</text>
+    <text x="540" y="130" fill="#9fb0c3" font-size="13">More virtual nodes → smaller, more</text>
+    <text x="540" y="150" fill="#9fb0c3" font-size="13">numerous arcs → smoother balance</text>
+  </svg>
+  <div class="legend" style="margin-top:8px">
+    <span><i class="dot" style="background:#ff8a65"></i>Cluster A</span>
+    <span><i class="dot" style="background:#4caf50"></i>Cluster B</span>
+    <span><i class="dot" style="background:#ba68c8"></i>Cluster C</span>
+  </div>
+  <p class="muted"><code>extractShardConfig</code> walks the ring and assigns each shard to the owning cluster; <code>addClusterId</code>/<code>deleteClusterId</code> mutate the ring.</p>
+</section>
+
+<section>
+  <h2>3. What changes when you add a cluster</h2>
+  <p>A new cluster inserts a point on the ring and <b>only steals the arc between its point and the next point</b> from a single predecessor. All other arcs stay put. With consistent hashing, going from N to N+1 clusters moves roughly <b>1/(N+1)</b> of all shards.</p>
+  <svg viewBox="0 0 760 200" role="img" aria-label="Before and after adding cluster D">
+    <text x="20" y="20" fill="#cfe3ff">Before: A | B | C</text>
+    <rect x="20" y="35" width="220" height="40" fill="#ff8a65"/><rect x="240" y="35" width="220" height="40" fill="#4caf50"/><rect x="460" y="35" width="220" height="40" fill="#ba68c8"/>
+    <text x="120" y="60" text-anchor="middle">A</text><text x="350" y="60" text-anchor="middle">B</text><text x="570" y="60" text-anchor="middle">C</text>
+    <text x="20" y="120" fill="#cfe3ff">After: D takes part of B's arc</text>
+    <rect x="20" y="135" width="220" height="40" fill="#ff8a65"/><rect x="240" y="135" width="110" height="40" fill="#4caf50"/><rect x="350" y="135" width="110" height="40" fill="#ffd54f"/><rect x="460" y="135" width="220" height="40" fill="#ba68c8"/>
+    <text x="120" y="160" text-anchor="middle">A</text><text x="295" y="160" text-anchor="middle">B</text><text x="405" y="160" text-anchor="middle" fill="#000">D</text><text x="570" y="160" text-anchor="middle">C</text>
+  </svg>
+  <p>Migration only flows from one predecessor into D (yellow). A and C are untouched.</p>
+</section>
+
+<section>
+  <h2>4. What changes when you remove a cluster</h2>
+  <p><code>deleteClusterId</code> drops all of that cluster's points; its arcs collapse into the <b>next surviving cluster</b>. Only the removed cluster's shards migrate (~1/N), and they land on neighbors &mdash; no other arcs move.</p>
+</section>
+
+<section>
+  <h2>5. Migration estimate</h2>
+  <p>With single virtual node and even spacing, the data to migrate is just the shards crossing ownership:</p>
+  <table>
+    <tr><th>Transition</th><th>Shards moved</th><th>Fraction</th></tr>
+    <tr><td>3 → 4 clusters (add)</td><td>≈ 4096/4 = 1024</td><td>~25%</td></tr>
+    <tr><td>4 → 5 clusters (add)</td><td>≈ 4096/5 ≈ 819</td><td>~20%</td></tr>
+    <tr><td>N → N+1 (add)</td><td>≈ 4096/(N+1)</td><td>~1/(N+1)</td></tr>
+    <tr><td>N → N−1 (remove)</td><td>≈ 4096/N</td><td>~1/N</td></tr>
+  </table>
+  <p>Per-shard bytes = total dataset / 4096, so migrated bytes ≈ (shards moved) × dataset/4096. More virtual nodes spread the moved shards across more sources but keep the same total fraction.</p>
+</section>
+
+<section>
+  <h2>6. Current state: scaffolding only</h2>
+  <div class="note">Dynamic re-sharding is <b>not yet wired</b>. <code>onboardCluster</code> computes the shard map but the rebalance / migration-task creation is commented out (static sharding only), and <code>MigrateBatch</code> has no server-side CallData. The estimates above describe expected behavior once enabled.</div>
+  <p class="muted">Source: <code>module/ClusterSetManager.cpp:412</code>, <code>object-store/network/RequestReceiver.cpp:76</code>.</p>
+</section>
+
+</main>
+</body>
+</html>
