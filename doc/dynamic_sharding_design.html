@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Goblin Dynamic Sharding — Design Walkthrough</title>
+<style>
+  :root {
+    --bg: #0f1220;
+    --panel: #171b2e;
+    --panel-2: #1e2440;
+    --ink: #e8ecf5;
+    --muted: #a3adc7;
+    --accent: #6ea8fe;
+    --accent-2: #7ee0b8;
+    --warn: #ffb454;
+    --danger: #ff7a85;
+    --src: #f0a35e;
+    --tgt: #6ee0a0;
+    --om: #b79bff;
+    --line: #2b3358;
+    --card-radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: linear-gradient(180deg, #0d1020 0%, #0f1220 100%);
+    color: var(--ink);
+    line-height: 1.6;
+  }
+  header {
+    padding: 48px 24px 32px;
+    text-align: center;
+    background: radial-gradient(1200px 300px at 50% -60px, rgba(110,168,254,0.18), transparent);
+    border-bottom: 1px solid var(--line);
+  }
+  header h1 { margin: 0 0 8px; font-size: 2.1rem; letter-spacing: 0.3px; }
+  header p.meta { margin: 4px 0; color: var(--muted); font-size: 0.95rem; }
+  .layout { display: flex; max-width: 1180px; margin: 0 auto; }
+  nav {
+    position: sticky; top: 0; align-self: flex-start;
+    width: 240px; padding: 24px 16px; height: 100vh; overflow-y: auto;
+    border-right: 1px solid var(--line); font-size: 0.9rem;
+  }
+  nav a { display: block; color: var(--muted); text-decoration: none; padding: 6px 8px; border-radius: 8px; }
+  nav a:hover { color: var(--ink); background: var(--panel-2); }
+  nav .grp { color: var(--accent); font-weight: 700; margin: 14px 0 4px; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.6px; }
+  main { flex: 1; min-width: 0; padding: 24px 28px 80px; }
+  section { margin-bottom: 44px; scroll-margin-top: 16px; }
+  h2 { font-size: 1.5rem; border-left: 4px solid var(--accent); padding-left: 12px; margin-top: 0; }
+  h3 { font-size: 1.12rem; color: var(--accent-2); margin-top: 26px; }
+  p, li { color: #d7deee; }
+  code { background: #0b0e1a; padding: 2px 6px; border-radius: 6px; font-size: 0.86em; color: #ffd9a8; border: 1px solid #262c48; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--card-radius); padding: 18px 20px; margin: 16px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.76rem; font-weight: 700; }
+  .pill.export { background: rgba(240,163,94,0.18); color: var(--src); border: 1px solid rgba(240,163,94,0.5); }
+  .pill.import { background: rgba(110,224,160,0.16); color: var(--tgt); border: 1px solid rgba(110,224,160,0.5); }
+  .pill.om { background: rgba(183,155,255,0.16); color: var(--om); border: 1px solid rgba(183,155,255,0.5); }
+  .legend { display: flex; gap: 18px; flex-wrap: wrap; margin: 8px 0 4px; font-size: 0.85rem; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 14px; height: 14px; border-radius: 4px; display: inline-block; }
+  figure { margin: 12px 0; }
+  figcaption { color: var(--muted); font-size: 0.85rem; text-align: center; margin-top: 6px; }
+  .svgwrap { width: 100%; overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: var(--card-radius); padding: 12px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--accent); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.5px; }
+  tr:hover td { background: rgba(110,168,254,0.05); }
+  .risk { border-left: 4px solid var(--danger); background: rgba(255,122,133,0.06); }
+  .risk h3 { color: var(--danger); margin-top: 0; }
+  .sev { font-size: 0.72rem; font-weight: 700; padding: 1px 8px; border-radius: 999px; margin-left: 8px; }
+  .sev.high { background: rgba(255,122,133,0.2); color: var(--danger); }
+  .sev.med { background: rgba(255,180,84,0.2); color: var(--warn); }
+  .sev.low { background: rgba(126,224,184,0.2); color: var(--accent-2); }
+  .callout { border-left: 4px solid var(--warn); background: rgba(255,180,84,0.07); padding: 12px 16px; border-radius: 0 10px 10px 0; }
+  .tag { font-family: ui-monospace, monospace; font-size: 0.82rem; color: var(--accent-2); }
+  ol.steps { counter-reset: step; list-style: none; padding-left: 0; }
+  ol.steps > li { counter-increment: step; position: relative; padding: 8px 0 8px 44px; border-bottom: 1px dashed var(--line); }
+  ol.steps > li::before {
+    content: counter(step); position: absolute; left: 0; top: 8px;
+    width: 28px; height: 28px; border-radius: 50%; background: var(--accent);
+    color: #08101f; font-weight: 800; display: flex; align-items: center; justify-content: center; font-size: 0.9rem;
+  }
+  @media (max-width: 900px) {
+    nav { display: none; }
+    .grid2 { grid-template-columns: 1fr; }
+  }
+  footer { text-align: center; color: var(--muted); font-size: 0.82rem; padding: 24px; border-top: 1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧭 Goblin Dynamic Sharding</h1>
+  <p class="meta">A visual walkthrough of the data-migration design between Goblin OS clusters</p>
+  <p class="meta">Author: Dongbin Cheng · Design date: 2026-06-26 · Rendered doc</p>
+</header>
+
+<div class="layout">
+<nav>
+  <div class="grp">Overview</div>
+  <a href="#background">Background</a>
+  <a href="#requirements">Requirements</a>
+  <a href="#glossary">Glossary &amp; Actors</a>
+  <a href="#topology">System Topology</a>
+  <div class="grp">The Design</div>
+  <a href="#lifecycle">Migration Lifecycle</a>
+  <a href="#om-driver">1. OM Task Driver</a>
+  <a href="#labeling">2. Shard Labeling</a>
+  <a href="#keymove">3. Key Move (Start/Finish)</a>
+  <a href="#reads-writes">4. Source-anchored I/O</a>
+  <a href="#bump">5. Bump Route Version</a>
+  <a href="#request-matrix">Request Handling Matrix</a>
+  <a href="#seq">End-to-End Sequence</a>
+  <div class="grp">Analysis</div>
+  <a href="#risks">Risks &amp; Concerns</a>
+  <a href="#summary">Summary</a>
+</nav>
+
+<main>
+
+<section id="background">
+  <h2>Background</h2>
+  <div class="card">
+    <p>Goblin already supports <strong>Raft Reconfiguration</strong> to resize a single Raft cluster. This design adds
+    <strong>Dynamic Sharding</strong>: scaling the <em>number</em> of Goblin OS clusters and moving data between them
+    while the system stays online.</p>
+    <p>Scope of this document is <strong>data migration between clusters only</strong>. Cluster build / destroy is out of scope.</p>
+  </div>
+  <div class="legend">
+    <span><i class="swatch" style="background:var(--om)"></i> OneOM (route brain)</span>
+    <span><i class="swatch" style="background:var(--src)"></i> Source OS cluster (EXPORTING)</span>
+    <span><i class="swatch" style="background:var(--tgt)"></i> Target OS cluster (IMPORTING)</span>
+    <span><i class="swatch" style="background:var(--accent)"></i> Client</span>
+  </div>
+</section>
+
+<section id="requirements">
+  <h2>Requirements at a Glance</h2>
+  <div class="grid2">
+    <div class="card">
+      <h3 style="margin-top:0">Functional</h3>
+      <ul>
+        <li>Increase / decrease shard count for one Goblin OS.</li>
+        <li><strong>No data loss</strong> during migration.</li>
+        <li>Clients always read the <strong>latest value/version</strong> of a key — whether it sits on the source or the target.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Non-functional</h3>
+      <ul>
+        <li>Migration must not hurt availability of OM or OS clusters.</li>
+        <li>Tolerate leader change / rollout: <strong>every state change is persisted in the Raft log</strong> and replayed into the state machine, so migration resumes from its breakpoint.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="glossary">
+  <h2>Glossary &amp; Actors</h2>
+  <table>
+    <tr><th>Term</th><th>Meaning</th></tr>
+    <tr><td><span class="tag">OneOM (OM)</span></td><td>Holds all Goblin OS route info in its local state machine. Route info per cluster lives under an <code>app_env</code> namespace.</td></tr>
+    <tr><td><span class="tag">OS cluster</span></td><td>A Raft cluster that stores KV data and serves put/get/delete traffic.</td></tr>
+    <tr><td><span class="tag">Shard</span></td><td>Each key maps (via consistent hashing) to one of <strong>4096</strong> shards. A shard is stored by one or more OS clusters.</td></tr>
+    <tr><td><span class="tag">Route info</span></td><td>OS UDNS of every partition + the <em>shard&nbsp;→&nbsp;cluster</em> mapping. Determines which OS cluster owns a key.</td></tr>
+    <tr><td><span class="tag">routeVersion</span></td><td>Monotonic version of route info. OM bumps it when pods/partitions change.</td></tr>
+    <tr><td><span class="tag">EAL</span></td><td>The RocksDB-backed apply layer (durable state machine), distinct from the in-memory state machine (CPL).</td></tr>
+    <tr><td><span class="pill export">EXPORTING</span></td><td>Label on a shard the source cluster is sending away.</td></tr>
+    <tr><td><span class="pill import">IMPORTING</span></td><td>Label on a shard the target cluster is receiving.</td></tr>
+  </table>
+  <div class="callout">
+    <strong>Route-version handshake (existing behavior):</strong>
+    If the client's <code>routeVersion</code> &lt; server's → reject <code>CLIENT_ROUTE_OUT_OF_DATE</code> (client refreshes from OM).
+    If client's &gt; server's → reject <code>SERVER_ROUTE_OUT_OF_DATE</code> (server refreshes from OM).
+    The OS leader refreshes route info in <code>onBecomeLeader</code> before serving traffic.
+  </div>
+</section>
+
+<section id="topology">
+  <h2>System Topology</h2>
+  <div class="svgwrap">
+    <svg viewBox="0 0 900 380" width="900" height="380" role="img" aria-label="System topology diagram">
+      <defs>
+        <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto">
+          <path d="M0,0 L8,3 L0,6 Z" fill="#8aa0d8"/>
+        </marker>
+      </defs>
+      <!-- Client -->
+      <rect x="40" y="150" width="130" height="70" rx="10" fill="#12203c" stroke="var(--accent)"/>
+      <text x="105" y="180" fill="#dbe6ff" font-size="15" text-anchor="middle" font-weight="700">Client</text>
+      <text x="105" y="200" fill="#9fb3dd" font-size="11" text-anchor="middle">caches routeVersion</text>
+
+      <!-- OM -->
+      <rect x="360" y="30" width="180" height="80" rx="10" fill="#221a3d" stroke="var(--om)"/>
+      <text x="450" y="60" fill="#e4dcff" font-size="15" text-anchor="middle" font-weight="700">OneOM</text>
+      <text x="450" y="80" fill="#c3b6f0" font-size="11" text-anchor="middle">route info + migration tasks</text>
+      <text x="450" y="96" fill="#8f7fd0" font-size="10" text-anchor="middle">(Raft log &amp; state machine)</text>
+
+      <!-- Source -->
+      <rect x="320" y="250" width="200" height="90" rx="10" fill="#3a2a15" stroke="var(--src)"/>
+      <text x="420" y="282" fill="#ffdcae" font-size="15" text-anchor="middle" font-weight="700">Source OS cluster</text>
+      <text x="420" y="303" fill="#f0c79a" font-size="11" text-anchor="middle">owns shard S</text>
+      <text x="420" y="322" fill="#f0a35e" font-size="11" text-anchor="middle" font-weight="700">S = EXPORTING</text>
+
+      <!-- Target -->
+      <rect x="640" y="250" width="200" height="90" rx="10" fill="#153524" stroke="var(--tgt)"/>
+      <text x="740" y="282" fill="#c6f5dc" font-size="15" text-anchor="middle" font-weight="700">Target OS cluster</text>
+      <text x="740" y="303" fill="#a7e6c4" font-size="11" text-anchor="middle">receiving shard S</text>
+      <text x="740" y="322" fill="#6ee0a0" font-size="11" text-anchor="middle" font-weight="700">S = IMPORTING</text>
+
+      <!-- edges -->
+      <line x1="170" y1="170" x2="360" y2="80" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#arrow)"/>
+      <text x="250" y="112" fill="#9fb3dd" font-size="10.5">1. getRoute()</text>
+
+      <line x1="170" y1="195" x2="320" y2="285" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#arrow)"/>
+      <text x="205" y="255" fill="#9fb3dd" font-size="10.5">2. put/get (source-anchored)</text>
+
+      <line x1="520" y1="300" x2="640" y2="300" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#arrow)"/>
+      <text x="540" y="292" fill="#9fb3dd" font-size="10.5">MigrateBatch</text>
+
+      <line x1="450" y1="110" x2="430" y2="250" stroke="var(--om)" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+      <text x="455" y="185" fill="#c3b6f0" font-size="10.5">Start/Finish/EndMigration</text>
+
+      <line x1="490" y1="110" x2="720" y2="250" stroke="var(--om)" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+      <text x="600" y="175" fill="#c3b6f0" font-size="10.5">Start/Finish/EndMigration</text>
+    </svg>
+  </div>
+  <figcaption>OM orchestrates; clients keep talking to the <strong>source</strong> cluster until a shard is fully moved and the route version bumps.</figcaption>
+</section>
+
+<section id="lifecycle">
+  <h2>Migration Lifecycle (bird's-eye)</h2>
+  <div class="svgwrap">
+    <svg viewBox="0 0 940 150" width="940" height="150" role="img" aria-label="Lifecycle stages">
+      <defs>
+        <marker id="a2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#6ea8fe"/></marker>
+      </defs>
+      <g font-size="12" text-anchor="middle">
+        <rect x="10"  y="45" width="150" height="60" rx="10" fill="#221a3d" stroke="var(--om)"/>
+        <text x="85" y="70" fill="#e4dcff" font-weight="700">AddCluster</text>
+        <text x="85" y="90" fill="#c3b6f0">recompute ring,</text>
+        <text x="85" y="104" fill="#c3b6f0" font-size="10">record MigrationTask</text>
+
+        <rect x="200" y="45" width="150" height="60" rx="10" fill="#3a2a15" stroke="var(--src)"/>
+        <text x="275" y="70" fill="#ffdcae" font-weight="700">Label shard</text>
+        <text x="275" y="90" fill="#f0c79a" font-size="10">EXPORTING / IMPORTING</text>
+
+        <rect x="390" y="45" width="160" height="60" rx="10" fill="#3a2a15" stroke="var(--src)"/>
+        <text x="470" y="68" fill="#ffdcae" font-weight="700">Move keys</text>
+        <text x="470" y="86" fill="#f0c79a" font-size="10">Start → MigrateBatch</text>
+        <text x="470" y="100" fill="#f0c79a" font-size="10">→ Finish (per batch)</text>
+
+        <rect x="590" y="45" width="160" height="60" rx="10" fill="#12203c" stroke="var(--accent)"/>
+        <text x="670" y="70" fill="#dbe6ff" font-weight="700">Source-anchored</text>
+        <text x="670" y="90" fill="#9fb3dd" font-size="10">reads/writes served,</text>
+        <text x="670" y="103" fill="#9fb3dd" font-size="10">MIGRATED_ROUTE if moved</text>
+
+        <rect x="790" y="45" width="140" height="60" rx="10" fill="#153524" stroke="var(--tgt)"/>
+        <text x="860" y="70" fill="#c6f5dc" font-weight="700">Bump version</text>
+        <text x="860" y="90" fill="#a7e6c4" font-size="10">drop labels,</text>
+        <text x="860" y="103" fill="#a7e6c4" font-size="10">next shard</text>
+
+        <line x1="160" y1="75" x2="198" y2="75" stroke="#6ea8fe" stroke-width="2" marker-end="url(#a2)"/>
+        <line x1="350" y1="75" x2="388" y2="75" stroke="#6ea8fe" stroke-width="2" marker-end="url(#a2)"/>
+        <line x1="550" y1="75" x2="588" y2="75" stroke="#6ea8fe" stroke-width="2" marker-end="url(#a2)"/>
+        <line x1="750" y1="75" x2="788" y2="75" stroke="#6ea8fe" stroke-width="2" marker-end="url(#a2)"/>
+      </g>
+    </svg>
+  </div>
+  <figcaption>Five stages, repeated shard-by-shard. Every arrow is backed by a persisted Raft command so it survives leader changes.</figcaption>
+</section>
+
+<section id="om-driver">
+  <h2>1 · OM Task Driver — per-shard orchestration</h2>
+  <div class="card">
+    <p><code>AddCluster</code> / <code>RemoveCluster</code> (scoped by <code>app_env</code>) recomputes the consistent-hashing ring and records a
+    <strong>MigrationTask</strong> into the Raft log &amp; state machine. A background consumer in OM then processes the task <strong>shard by shard</strong>:</p>
+    <ol class="steps">
+      <li>Generate a <span class="tag">ShardMigration</span> command in OM, persist to Raft log.</li>
+      <li>After it applies, send <span class="tag">StartMigration</span> RPC to <em>both</em> source &amp; target OS clusters.</li>
+      <li>When OM receives <span class="tag">OnMigration</span> from the source, it generates a <span class="tag">FinishShardMigration</span> command.</li>
+      <li>After that applies, OM sends <span class="tag">FinishMigration</span> (then later <span class="tag">EndMigration</span> with the bumped route) to source &amp; target.</li>
+    </ol>
+    <p>Because every step is a committed command, a leader change / rollout in OM does not lose progress — the task resumes at its breakpoint.</p>
+  </div>
+</section>
+
+<section id="labeling">
+  <h2>2 · Labeling Shards to be Migrated</h2>
+  <div class="card">
+    <p>When source/target OS clusters receive <span class="tag">StartMigration</span>, each generates a <span class="tag">ShardMigration</span> command
+    persisted into its own Raft log &amp; state machine, labeling the shard <span class="pill export">EXPORTING</span> (source) or
+    <span class="pill import">IMPORTING</span> (target).</p>
+    <p>Once committed, a consumer thread in the OS generates many <strong>MigrationCommands</strong> in the background to move all keys of that
+    shard from the source — one by one, or batch by batch.</p>
+  </div>
+</section>
+
+<section id="keymove">
+  <h2>3 · Key Move — Start &amp; Finish commands</h2>
+  <p>The move of each key batch on the <strong>source</strong> cluster is split into two persisted commands. Note the two apply layers:
+  the in-memory state machine and the durable <strong>EAL</strong> (RocksDB).</p>
+
+  <div class="svgwrap">
+    <svg viewBox="0 0 900 430" width="900" height="430" role="img" aria-label="Start/Finish command apply flow">
+      <defs>
+        <marker id="a3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8aa0d8"/></marker>
+      </defs>
+      <!-- columns -->
+      <text x="230" y="26" fill="#ffd9a8" font-size="14" font-weight="700" text-anchor="middle">MigrationKeysStartCommand</text>
+      <text x="680" y="26" fill="#ffd9a8" font-size="14" font-weight="700" text-anchor="middle">MigrationKeysFinishCommand</text>
+
+      <!-- Start: mem -->
+      <rect x="60" y="50" width="340" height="70" rx="10" fill="#1b2136" stroke="#3a4570"/>
+      <text x="230" y="76" fill="#dbe6ff" font-size="12.5" text-anchor="middle" font-weight="700">Apply in in-memory state machine</text>
+      <text x="230" y="98" fill="#9fb3dd" font-size="11.5" text-anchor="middle">Leader marks migrated keys with <tspan fill="#ff9aa5" font-weight="700">DELETE</tspan></text>
+
+      <!-- Start: EAL -->
+      <rect x="60" y="140" width="340" height="150" rx="10" fill="#2a2118" stroke="var(--src)"/>
+      <text x="230" y="164" fill="#ffdcae" font-size="12.5" text-anchor="middle" font-weight="700">Apply in EAL (leader) — blocking</text>
+      <text x="230" y="188" fill="#f0c79a" font-size="11" text-anchor="middle">a) create MigrationKeys Task in RocksDB</text>
+      <text x="230" y="208" fill="#f0c79a" font-size="11" text-anchor="middle">b) MigrateBatch RPC → target cluster</text>
+      <text x="230" y="230" fill="#f0c79a" font-size="11" text-anchor="middle">wait for SUCCESS response</text>
+      <text x="230" y="254" fill="#7ee0b8" font-size="11" text-anchor="middle" font-weight="700">→ then emit MigrationKeysFinishCommand</text>
+      <text x="230" y="276" fill="#8f9ec0" font-size="10" text-anchor="middle">(follower: create Task only, no RPC)</text>
+
+      <!-- Finish: mem+EAL -->
+      <rect x="510" y="140" width="340" height="150" rx="10" fill="#2a2118" stroke="var(--src)"/>
+      <text x="680" y="170" fill="#ffdcae" font-size="12.5" text-anchor="middle" font-weight="700">Apply in EAL — blocking</text>
+      <text x="680" y="196" fill="#f0c79a" font-size="11.5" text-anchor="middle">delete the migrated keys</text>
+      <text x="680" y="218" fill="#f0c79a" font-size="11.5" text-anchor="middle">delete the MigrationKeys Task</text>
+      <text x="680" y="252" fill="#8f9ec0" font-size="10.5" text-anchor="middle">leader &amp; follower both do this</text>
+
+      <!-- arrows -->
+      <line x1="230" y1="120" x2="230" y2="138" stroke="#8aa0d8" stroke-width="2" marker-end="url(#a3)"/>
+      <path d="M400,215 C455,215 455,215 508,215" fill="none" stroke="#7ee0b8" stroke-width="2" marker-end="url(#a3)"/>
+
+      <!-- target box -->
+      <rect x="510" y="60" width="340" height="60" rx="10" fill="#153524" stroke="var(--tgt)"/>
+      <text x="680" y="84" fill="#c6f5dc" font-size="12" text-anchor="middle" font-weight="700">Target: MigrateBatch handler</text>
+      <text x="680" y="104" fill="#a7e6c4" font-size="10.5" text-anchor="middle">idempotent / de-duplicated (guards against ABA)</text>
+      <line x1="400" y1="200" x2="508" y2="110" stroke="#8aa0d8" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#a3)"/>
+
+      <text x="450" y="340" fill="#a3adc7" font-size="11.5" text-anchor="middle">All EAL operations are BLOCKING: the local delete happens only after the target confirms it stored the data — so no data loss.</text>
+      <text x="450" y="366" fill="#a3adc7" font-size="11.5" text-anchor="middle">Source keeps retrying MigrateBatch until success; the target must de-duplicate to avoid double-apply (ABA).</text>
+    </svg>
+  </div>
+  <figcaption>Store-then-delete ordering. The durable "MigrationKeys Task" record lets a new leader know a batch was in flight.</figcaption>
+</section>
+
+<section id="reads-writes">
+  <h2>4 · Source-anchored Reads &amp; Writes</h2>
+  <div class="card">
+    <p>During a shard migration the OM route version is <strong>not</strong> bumped yet, so clients keep sending shard-<em>S</em> keys to the
+    <strong>source</strong> cluster:</p>
+    <ul>
+      <li><strong>Key still on source</strong> → source handles it normally.</li>
+      <li><strong>Key already moved</strong> → reply <code>MIGRATED_ROUTE</code>; client retries against the target cluster.</li>
+      <li>The <strong>target</strong> accepts requests for keys in an <span class="pill import">IMPORTING</span> shard even though route info doesn't yet assign that shard to it.</li>
+    </ul>
+    <div class="callout">
+      Before replying <code>MIGRATED_ROUTE</code>, the server must wait until <code>appliedIndex</code> ≥ the max version it saw in <strong>CPL</strong>.
+      This guarantees the "not found → migrated" decision is based on fully-applied state, not just committed state.
+    </div>
+  </div>
+</section>
+
+<section id="bump">
+  <h2>5 · Bump Route Version When a Shard is Done</h2>
+  <div class="card">
+    <ol class="steps">
+      <li>Source finishes the shard → sends <span class="tag">OnMigration</span> to OM.</li>
+      <li>OM <strong>bumps the route version</strong> and sends the new route to source &amp; target via <span class="tag">EndMigration</span>.</li>
+      <li>Both clusters remove the <span class="pill export">EXPORTING</span> / <span class="pill import">IMPORTING</span> label for that shard.</li>
+      <li>Clients refresh route info and now send migrated keys straight to the target cluster.</li>
+    </ol>
+  </div>
+  <h3>Repeat for many shards</h3>
+  <p>OM can run <strong>concurrent</strong> shard migrations across <em>different</em> OS clusters, but <strong>only one shard at a time per cluster</strong>
+  to protect serving latency. When one shard finishes, OM triggers the next.</p>
+  <h3>Exposed migration status</h3>
+  <p>OM exposes a gRPC status call (used by admin / <em>erdapel</em>) reporting how many shards have been migrated so far.</p>
+</section>
+
+<section id="request-matrix">
+  <h2>Request Handling Matrix (shard in EXPORTING)</h2>
+  <p>If a cluster owns any <span class="pill export">EXPORTING</span> shard, requests to that shard are handled specially: every request must
+  first check whether the key <em>still exists locally</em>, and the reply depends on the version <strong>applied in CPL</strong> (not merely committed),
+  because a committed index cannot guarantee the key was persisted on the target.</p>
+  <table>
+    <tr><th>Command</th><th>Key exists</th><th>Key not exist</th></tr>
+    <tr>
+      <td><strong>Read</strong></td>
+      <td>wait readVersion <em>committed</em> → reply <code>OK</code></td>
+      <td>wait read/deleted version <em>applied</em> → reply <code>MIGRATED_ROUTE</code> → client retries target</td>
+    </tr>
+    <tr>
+      <td><strong>Write / Delete</strong></td>
+      <td>wait writeVersion <em>committed</em> → reply <code>OK</code></td>
+      <td>wait writeVersion <em>applied</em> → reply <code>MIGRATED_ROUTE</code> → client retries target</td>
+    </tr>
+    <tr>
+      <td><strong>Trans</strong></td>
+      <td colspan="2">All exist / all not-exist → same as above. <strong>Partially exist → retry</strong> (Redis-style <code>TRYAGAIN</code>).</td>
+    </tr>
+  </table>
+  <div class="callout">
+    <strong>Follower read open question (from the design):</strong> Can follower reads be redirected to a target-cluster follower?
+    A key that is being migrated and still exists may appear "not existing" on a target follower that hasn't yet applied the batch — a correctness hazard.
+  </div>
+</section>
+
+<section id="seq">
+  <h2>End-to-End Sequence (single shard)</h2>
+  <div class="svgwrap">
+    <svg viewBox="0 0 900 560" width="900" height="560" role="img" aria-label="End to end sequence diagram">
+      <defs>
+        <marker id="sa" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8aa0d8"/></marker>
+      </defs>
+      <!-- lifelines -->
+      <g font-size="12" text-anchor="middle" font-weight="700">
+        <rect x="60" y="20" width="120" height="34" rx="8" fill="#12203c" stroke="var(--accent)"/><text x="120" y="42" fill="#dbe6ff">Client</text>
+        <rect x="270" y="20" width="120" height="34" rx="8" fill="#221a3d" stroke="var(--om)"/><text x="330" y="42" fill="#e4dcff">OneOM</text>
+        <rect x="480" y="20" width="140" height="34" rx="8" fill="#3a2a15" stroke="var(--src)"/><text x="550" y="42" fill="#ffdcae">Source OS</text>
+        <rect x="710" y="20" width="140" height="34" rx="8" fill="#153524" stroke="var(--tgt)"/><text x="780" y="42" fill="#c6f5dc">Target OS</text>
+      </g>
+      <g stroke="#33406b" stroke-dasharray="3 5">
+        <line x1="120" y1="54" x2="120" y2="540"/>
+        <line x1="330" y1="54" x2="330" y2="540"/>
+        <line x1="550" y1="54" x2="550" y2="540"/>
+        <line x1="780" y1="54" x2="780" y2="540"/>
+      </g>
+      <g font-size="10.5" fill="#c8d3ec">
+        <!-- AddCluster / task -->
+        <line x1="330" y1="80" x2="330" y2="80"/>
+        <rect x="300" y="70" width="60" height="20" rx="4" fill="#2a2350" stroke="var(--om)"/><text x="330" y="84" text-anchor="middle" fill="#d9ceff">AddCluster</text>
+
+        <!-- StartMigration -->
+        <line x1="330" y1="110" x2="548" y2="110" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#sa)"/><text x="440" y="104" text-anchor="middle">StartMigration</text>
+        <line x1="330" y1="130" x2="778" y2="130" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#sa)"/><text x="560" y="124" text-anchor="middle">StartMigration</text>
+        <text x="550" y="150" text-anchor="middle" fill="#f0a35e">label S=EXPORTING</text>
+        <text x="780" y="150" text-anchor="middle" fill="#6ee0a0">label S=IMPORTING</text>
+
+        <!-- batch loop -->
+        <rect x="470" y="168" width="360" height="150" rx="8" fill="none" stroke="#44507e" stroke-dasharray="5 4"/>
+        <text x="486" y="184" fill="#9fb3dd">loop: per key batch</text>
+        <text x="550" y="206" text-anchor="middle" fill="#f0c79a">Start: mark DELETE (mem)</text>
+        <text x="550" y="224" text-anchor="middle" fill="#f0c79a">EAL: create Task</text>
+        <line x1="550" y1="236" x2="778" y2="236" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#sa)"/><text x="664" y="230" text-anchor="middle">MigrateBatch (ret”d, idempotent)</text>
+        <line x1="778" y1="258" x2="552" y2="258" stroke="#7ee0b8" stroke-width="1.6" marker-end="url(#sa)"/><text x="664" y="252" text-anchor="middle" fill="#a7e6c4">SUCCESS</text>
+        <text x="550" y="280" text-anchor="middle" fill="#f0c79a">Finish: delete keys + Task (EAL)</text>
+
+        <!-- client during migration -->
+        <line x1="120" y1="340" x2="548" y2="340" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#sa)"/><text x="330" y="334" text-anchor="middle">get/put key in S (source-anchored)</text>
+        <line x1="548" y1="362" x2="122" y2="362" stroke="#ff9aa5" stroke-width="1.6" marker-end="url(#sa)"/><text x="330" y="356" text-anchor="middle" fill="#ff9aa5">MIGRATED_ROUTE (if already moved)</text>
+        <line x1="120" y1="384" x2="778" y2="384" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#sa)"/><text x="440" y="378" text-anchor="middle">retry against target (IMPORTING accepts)</text>
+
+        <!-- finish shard -->
+        <line x1="550" y1="420" x2="332" y2="420" stroke="#8aa0d8" stroke-width="1.6" marker-end="url(#sa)"/><text x="440" y="414" text-anchor="middle">OnMigration (shard done)</text>
+        <rect x="300" y="432" width="60" height="20" rx="4" fill="#2a2350" stroke="var(--om)"/><text x="330" y="446" text-anchor="middle" fill="#d9ceff">bump ver</text>
+        <line x1="330" y1="470" x2="548" y2="470" stroke="var(--om)" stroke-width="1.6" marker-end="url(#sa)"/><text x="440" y="464" text-anchor="middle">EndMigration (new route)</text>
+        <line x1="330" y1="490" x2="778" y2="490" stroke="var(--om)" stroke-width="1.6" marker-end="url(#sa)"/><text x="560" y="484" text-anchor="middle">EndMigration (new route)</text>
+        <text x="665" y="510" text-anchor="middle" fill="#a7e6c4">drop labels; clients refresh → target</text>
+      </g>
+    </svg>
+  </div>
+  <figcaption>The client never blocks: it is redirected only when its key has already moved, and the shard "flips" to the target only after the route version bumps.</figcaption>
+</section>
+
+<section id="risks">
+  <h2>⚠️ Risks &amp; Concerns</h2>
+  <p>The design is careful about durability and leader-change tolerance. The items below are areas worth pinning down before/while implementing.</p>
+
+  <div class="card risk">
+    <h3>R1 · Follower reads on the target can return stale "not found" <span class="sev high">High</span></h3>
+    <p>The design itself flags this. If follower reads are redirected to a target follower, a key that <em>does</em> exist (already migrated, but that
+    follower hasn't applied the batch) can look "not existing," violating the "always see latest value" requirement. Recommend: disallow follower reads
+    for IMPORTING/EXPORTING shards, or gate them on the follower's applied index ≥ the batch's migration index.</p>
+  </div>
+
+  <div class="card risk">
+    <h3>R2 · MigrateBatch idempotency &amp; the ABA hazard <span class="sev high">High</span></h3>
+    <p>Correctness hinges entirely on the target's de-duplication. Consider: source moves key <code>k=v1</code>, target applies it, then a new client write
+    <code>k=v2</code> lands on the target (IMPORTING accepts it); a delayed retry of the original MigrateBatch could overwrite <code>v2</code> back to
+    <code>v1</code>. De-dup "already executed" is not enough — the dedup key must be per-batch/per-version and the handler must reject
+    <em>stale-version</em> writes, not just duplicate ones. This needs an explicit spec (e.g. version-conditioned upsert).</p>
+  </div>
+
+  <div class="card risk">
+    <h3>R3 · Committed vs. applied divergence between leader and followers <span class="sev med">Medium</span></h3>
+    <p>Reads on an existing key reply after "committed", but writes/deletes on a not-exist key reply after "applied". The rationale is sound, yet mixing
+    the two thresholds for the same shard is subtle. A leader that crashes between "committed" and "applied" could let a new leader answer differently.
+    Recommend documenting the exact wait condition (the <code>appliedIndex ≥ maxVersion in CPL</code> rule) uniformly and adding tests around the crash window.</p>
+  </div>
+
+  <div class="card risk">
+    <h3>R4 · Window where a key exists on neither / both clusters <span class="sev med">Medium</span></h3>
+    <p>Between "delete on source (EAL)" and "route bump", the key lives only on the target while the shard still routes to source. This is handled by
+    <code>MIGRATED_ROUTE</code> + target accepting IMPORTING, but it depends on the client honoring the redirect promptly. A client with a very stale
+    route or a redirect loop (source says "migrated", target says <code>SERVER_ROUTE_OUT_OF_DATE</code>) could bounce. Worth a bounded retry / loop-breaker.</p>
+  </div>
+
+  <div class="card risk">
+    <h3>R5 · Blocking EAL apply can stall the state machine <span class="sev med">Medium</span></h3>
+    <p>MigrateBatch runs <em>inside</em> a blocking EAL apply and waits for the target's success. If the target is slow or partitioned, the source's apply
+    pipeline stalls — which can back up unrelated writes and hurt availability (a non-functional requirement). Recommend timeouts + async continuation
+    (persist Task, release apply thread, resume on callback) rather than blocking the apply loop on a network RPC.</p>
+  </div>
+
+  <div class="card risk">
+    <h3>R6 · Marking DELETE in memory before EAL durability <span class="sev med">Medium</span></h3>
+    <p><code>MigrationKeysStartCommand</code> marks keys DELETE in the in-memory machine first; durability/RPC happen in EAL. If the two layers can be observed
+    independently (e.g. a read served from memory), a key could appear deleted before it is safely on the target. Confirm reads always respect the EAL/applied
+    gate so the in-memory DELETE isn't visible prematurely.</p>
+  </div>
+
+  <div class="card risk">
+    <h3>R7 · Route bump is per-shard → many version bumps &amp; client refresh churn <span class="sev low">Low</span></h3>
+    <p>Migrating a large cluster moves many shards, each bumping the route version and forcing clients to refresh + retry (<code>CLIENT_ROUTE_OUT_OF_DATE</code>).
+    Under high fan-out this is extra OM load and client-side latency spikes. Consider batching label removals or coalescing version bumps where safe.</p>
+  </div>
+
+  <div class="card risk">
+    <h3>R8 · Concurrency scope &amp; ordering guarantees <span class="sev low">Low</span></h3>
+    <p>"One shard at a time per cluster" protects latency, but a cluster can be both a source (for shard A) and a target (for shard B) simultaneously
+    across different tasks. Ensure the "any EXPORTING shard → special handling" check, label bookkeeping, and status reporting compose correctly when a
+    cluster plays both roles. Also define behavior for RemoveCluster where the target set may itself be shrinking.</p>
+  </div>
+
+  <div class="card risk">
+    <h3>R9 · Failure / rollback path is underspecified <span class="sev low">Low</span></h3>
+    <p>The happy path is well covered, but what happens if a target cluster is permanently unhealthy mid-shard, or an operator aborts? There is no described
+    way to cancel a MigrationTask, un-label shards, or reconcile half-moved keys. A documented abort/rollback command would improve operability.</p>
+  </div>
+</section>
+
+<section id="summary">
+  <h2>Summary</h2>
+  <div class="card">
+    <p>Goblin Dynamic Sharding moves data <strong>shard by shard</strong> under OM orchestration, keeping traffic on the <strong>source</strong> cluster
+    until each shard is fully copied and durably confirmed on the target, then bumping the route version so clients flip to the target. Durability comes from
+    the <strong>store-then-delete</strong> ordering inside blocking EAL applies, and resilience comes from persisting <strong>every</strong> state change as a
+    Raft command so migration resumes after leader changes.</p>
+    <p>The strongest areas to harden before production are: <strong>target-side idempotency/versioning (R2)</strong>, <strong>follower-read correctness (R1)</strong>,
+    and <strong>avoiding blocking the apply loop on network RPC (R5)</strong>.</p>
+  </div>
+</section>
+
+</main>
+</div>
+
+<footer>
+  Goblin Dynamic Sharding — rendered design walkthrough · Generated from the design doc by Dongbin Cheng (2026-06-26).
+</footer>
+</body>
+</html>
