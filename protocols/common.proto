@@ -126,8 +126,8 @@ message Migration {
 }
 
 // Per-key migration label persisted alongside a key during shard migration.
-// Stored both in memory (CPL) and rocksdb (EAL) in an independent structure/
-// column family so that it survives leader change and can be replayed.
+// Stored both in memory (CPL) and rocksdb (EAL) in an independent structure
+// (column family) so that it survives leader change and can be replayed.
 enum KeyMigrationLabel {
   // the key has no migration label; it can be served locally by the source
   NO_LABEL = 0;

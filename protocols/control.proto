@@ -25,8 +25,9 @@ service KVManager {
   rpc AddCluster(AddCluster.Request) returns (AddCluster.Response) {}
   rpc RemoveCluster(RemoveCluster.Request) returns (RemoveCluster.Response) {}
 
-  // report migration status, invoked by admin(erdapel) to show how many
-  // shards have been migrated so far for a given app_env (om namespace).
+  // report migration status, invoked by an admin/ops tool (e.g. erdapel) to
+  // show how many shards have been migrated so far for a given app_env
+  // (om namespace).
   rpc GetMigrationStatus(GetMigrationStatus.Request) returns (GetMigrationStatus.Response) {}
 
 }
