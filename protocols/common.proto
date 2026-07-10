@@ -29,6 +29,11 @@ enum ResponseCode {
   // server route info is out of date, it will refresh its routing info
   // clients should retry with the same address
   SERVER_ROUTE_OUT_OF_DATE= 453;
+  // the requested key belongs to a shard that is currently migrating on the
+  // source cluster (key is under MIGRATING label). To avoid ABA risk, the
+  // source cluster asks the client to resend the request after a backoff
+  // instead of waiting for the MigrationKeysFinishCommand to commit.
+  RETRY = 454;
   // general error
   GENERAL_ERROR = 503;
 }
@@ -117,6 +122,73 @@ message Migration {
     repeated MigrationEvent events = 2;
     MigrationStatus overallStatus = 3;
     // we can add more info to report the progress of migration
+  }
+}
+
+// Per-key migration label persisted alongside a key during shard migration.
+// Stored both in memory (CPL) and rocksdb (EAL) in an independent structure/
+// column family so that it survives leader change and can be replayed.
+enum KeyMigrationLabel {
+  // the key has no migration label; it can be served locally by the source
+  NO_LABEL = 0;
+  // MigrationKeysStartCommand has been applied for this key; the copy to the
+  // target cluster is in flight. Only set to MIGRATED once the
+  // MigrationKeysFinishCommand is committed, to avoid ABA on leader change.
+  MIGRATING = 1;
+  // MigrationKeysFinishCommand has been applied for this key; the value has
+  // been copied to the target cluster and is (being) removed on the source.
+  MIGRATED = 2;
+}
+
+// Raft-command payloads that persist every migration state transition so that
+// the migration can continue across leader change/rollout on both om and os.
+message MigrationCmd {
+  // OM side: recompute-the-ring result for one shard migration task. Applied on
+  // the om state machine before StartMigration rpc is sent to os clusters.
+  message ShardMigration {
+    uint64 taskId = 1;
+    uint64 shardId = 2;
+    Cluster.ClusterAddress sourceCluster = 3;
+    Cluster.ClusterAddress targetCluster = 4;
+  }
+  // OM side: applied after the source cluster reports OnMigration for a shard.
+  // After it is applied, om bumps the route version and sends EndMigration.
+  message FinishShardMigration {
+    uint64 taskId = 1;
+    uint64 shardId = 2;
+  }
+  // OS side (source & target): applied when StartMigration rpc is received.
+  // Labels the shard with EXPORTING (source) or IMPORTING (target).
+  message OSShardMigration {
+    uint64 taskId = 1;
+    repeated uint64 shardIds = 2;
+    // EXPORTING on the source cluster, IMPORTING on the target cluster.
+    Cluster.ClusterStatus role = 3;
+    RouteInfo routeInfo = 4;
+    Cluster.ClusterAddress sourceCluster = 5;
+    Cluster.ClusterAddress targetCluster = 6;
+  }
+  // OS source side: mark the given keys with the MIGRATING label. When applied
+  // in EAL, a SyncDataTask is generated and pushed to the MigrationQueue.
+  message MigrationKeysStart {
+    uint64 taskId = 1;
+    uint64 shardId = 2;
+    repeated bytes keys = 3;
+  }
+  // OS source side: mark the given keys with MIGRATED label, then delete them
+  // from CPL memory and EAL rocksdb. Generated after the target acks the batch.
+  message MigrationKeysFinish {
+    uint64 taskId = 1;
+    uint64 shardId = 2;
+    repeated bytes keys = 3;
+  }
+  // OS side: applied when EndMigration rpc is received from om. The source
+  // updates route info to reject keys in the finished shard and deletes the
+  // per-key labels; the target removes the IMPORTING label.
+  message FinishMigration {
+    uint64 taskId = 1;
+    repeated uint64 shardIds = 2;
+    RouteInfo routeInfo = 3;
   }
 }
 

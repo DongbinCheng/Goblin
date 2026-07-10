@@ -25,6 +25,10 @@ service KVManager {
   rpc AddCluster(AddCluster.Request) returns (AddCluster.Response) {}
   rpc RemoveCluster(RemoveCluster.Request) returns (RemoveCluster.Response) {}
 
+  // report migration status, invoked by admin(erdapel) to show how many
+  // shards have been migrated so far for a given app_env (om namespace).
+  rpc GetMigrationStatus(GetMigrationStatus.Request) returns (GetMigrationStatus.Response) {}
+
 }
 
 message Router {
@@ -73,5 +77,27 @@ message RemoveCluster {
   }
   message Response {
     ResponseHeader header = 1;
+  }
+}
+
+message GetMigrationStatus {
+  message Request {
+  }
+  // one entry per migration task tracked by om
+  message TaskStatus {
+    uint64 taskId = 1;
+    Cluster.ClusterAddress sourceCluster = 2;
+    Cluster.ClusterAddress targetCluster = 3;
+    Migration.MigrationStatus overallStatus = 4;
+    uint64 totalShards = 5;
+    uint64 migratedShards = 6;
+    // detailed per-shard progress, if reported by the source cluster
+    Migration.MigrationProgress progress = 7;
+  }
+  message Response {
+    ResponseHeader header = 1;
+    repeated TaskStatus tasks = 2;
+    uint64 totalShards = 3;
+    uint64 migratedShards = 4;
   }
 }

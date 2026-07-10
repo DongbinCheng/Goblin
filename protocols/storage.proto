@@ -1,6 +1,7 @@
 syntax = "proto3";
 
 import "userdefine.proto";
+import "common.proto";
 
 package goblin.proto;
 
@@ -26,6 +27,9 @@ message Meta {
   OpType opType = 5;
   uint32 updateTime = 6;
   UserDefinedMeta udfMeta = 7;
+  // per-key migration label (NO_LABEL/MIGRATING/MIGRATED) used during dynamic
+  // sharding shard migration to implement source-anchored reads/writes.
+  KeyMigrationLabel migrationLabel = 8;
 }
 
 message SingleValue {
