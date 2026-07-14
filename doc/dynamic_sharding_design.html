@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Goblin 动态分片（Dynamic Sharding）详细设计方案</title>
+<title>Goblin 集群弹性伸缩（Dynamic Clustering）详细设计方案</title>
 <style>
   :root{
     --bg:#0f1420; --panel:#171e2e; --panel2:#1e2740; --ink:#e7ecf5; --muted:#9fb0cd;
@@ -74,15 +74,17 @@
 <body>
 <div class="wrap">
 <header class="hero">
-  <h1>Goblin 动态分片（Dynamic Sharding）详细设计方案</h1>
-  <p class="sub">支持分片（shard）数量动态伸缩、集群弹性扩缩容与在线数据迁移；迁移全程不断流、不影响可用性。</p>
+  <h1>Goblin 集群弹性伸缩（Dynamic Clustering）详细设计方案</h1>
+  <p class="sub">分片总数固定为 4096；通过<strong>改变集群数量（M → N）</strong>把 4096 个分片在集群间重新划分，每个分片始终只属于一个集群。</p>
+  <p class="sub">重点阐述：① 重新划分后如何迁移某个分片的数据；② 如何处理正在被迁移分片的读写请求。迁移全程不断流。</p>
   <p class="sub">基于 <code>DongbinCheng/Goblin</code> 现有源码（构建于 <code>Gringofts</code> Raft 框架之上）设计。</p>
   <div class="badges">
     <span class="badge">强一致 KV 存储</span>
     <span class="badge">Raft 复制</span>
     <span class="badge">一致性哈希路由</span>
+    <span class="badge">4096 分片固定</span>
+    <span class="badge">集群数 M→N</span>
     <span class="badge">零停机迁移</span>
-    <span class="badge">Split / Merge 分裂合并</span>
     <span class="badge">Event-Sourcing</span>
   </div>
 </header>
@@ -99,24 +101,27 @@
   <a href="#s3">3. 开源方案借鉴</a>
   <a href="#s4">4. 设计总览</a>
   <a class="lvl2" href="#s4-1">4.1 核心思想</a>
-  <a class="lvl2" href="#s4-2">4.2 分层分片模型</a>
-  <a class="lvl2" href="#s4-3">4.3 组件职责</a>
-  <a href="#s5">5. 动态分片模型</a>
-  <a class="lvl2" href="#s5-1">5.1 逻辑槽 vs 物理分片</a>
-  <a class="lvl2" href="#s5-2">5.2 Shard 分裂</a>
-  <a class="lvl2" href="#s5-3">5.3 Shard 合并</a>
-  <a class="lvl2" href="#s5-4">5.4 元数据与状态机</a>
-  <a href="#s6">6. 在线迁移协议</a>
-  <a class="lvl2" href="#s6-1">6.1 迁移阶段</a>
-  <a class="lvl2" href="#s6-2">6.2 不断流一致性</a>
-  <a class="lvl2" href="#s6-3">6.3 路由版本栅栏</a>
-  <a href="#s7">7. 端到端流程</a>
-  <a href="#s8">8. Proto 与接口变更</a>
-  <a href="#s9">9. 容错与幂等</a>
-  <a href="#s10">10. 可用性与限流</a>
-  <a href="#s11">11. 分阶段实施计划</a>
-  <a href="#s12">12. 风险与权衡</a>
-  <a href="#s13">13. 附录：与开源对比</a>
+  <a class="lvl2" href="#s4-2">4.2 组件职责</a>
+  <a href="#s5">5. 分片重新划分</a>
+  <a class="lvl2" href="#s5-1">5.1 划分不变式</a>
+  <a class="lvl2" href="#s5-2">5.2 扩容 M→N</a>
+  <a class="lvl2" href="#s5-3">5.3 缩容 M→N</a>
+  <a class="lvl2" href="#s5-4">5.4 迁移计划与状态机</a>
+  <a href="#s6">6. 分片数据迁移</a>
+  <a class="lvl2" href="#s6-1">6.1 四阶段迁移协议</a>
+  <a class="lvl2" href="#s6-2">6.2 增量追平与去删除窗口</a>
+  <a class="lvl2" href="#s6-3">6.3 原子切流</a>
+  <a href="#s7">7. 迁移期读写请求处理</a>
+  <a class="lvl2" href="#s7-1">7.1 路由版本栅栏</a>
+  <a class="lvl2" href="#s7-2">7.2 源集群（EXPORTING）</a>
+  <a class="lvl2" href="#s7-3">7.3 目标集群（IMPORTING）</a>
+  <a class="lvl2" href="#s7-4">7.4 读写决策全表</a>
+  <a href="#s8">8. 端到端流程</a>
+  <a href="#s9">9. Proto 与接口变更</a>
+  <a href="#s10">10. 容错与幂等</a>
+  <a href="#s11">11. 可用性与限流</a>
+  <a href="#s12">12. 分阶段实施计划</a>
+  <a href="#s13">13. 风险与权衡</a>
 </nav>
 
 <main>
@@ -124,23 +129,34 @@
 <!-- ============ 1 ============ -->
 <section id="s1">
   <h2><span class="num">1</span>背景与目标</h2>
-  <p>Goblin 是构建在 <a class="ref" href="https://github.com/eBay/Gringofts">Gringofts</a> 之上的强一致 KV 存储系统。为突破单集群容量与吞吐上限，Goblin 通过<strong>分片（sharding）</strong>把 key 空间划分到多个 Object Store（OS）集群，实现水平扩展。</p>
-  <p>但当前实现为<strong>静态分片</strong>：分片总数固定为 <code>2<sup>12</sup> = 4096</code>，且在集群创建后无法在线增删集群、无法改变分片粒度（详见 <a class="ref" href="#s2">第 2 节</a> 与仓库 <code>doc/sharding.md</code>）。当单个 key 空间内部出现热点、或整体数据量增长超出预置集群容量时，系统缺乏弹性伸缩手段。</p>
+  <p>Goblin 是构建在 <a class="ref" href="https://github.com/eBay/Gringofts">Gringofts</a> 之上的强一致 KV 存储系统。为突破单集群容量与吞吐上限，Goblin 把 key 空间静态划分为 <code>2<sup>12</sup> = 4096</code> 个<strong>分片（shard）</strong>，再由 Object Manager（OM）用一致性哈希把这 4096 个分片映射到若干 Object Store（OS）集群。</p>
+  <p>本方案<strong>不改变分片总数</strong>：4096 个分片的划分粒度保持固定。真正需要弹性的是<strong>集群的数量</strong>——当整体数据量或吞吐增长时需要新增集群（scale-out），当负载回落时需要下线集群（scale-in）。因此核心问题收敛为一句话：</p>
+  <div class="callout good">
+    <span class="tag">问题定义</span>
+    如何把这 <strong>4096 个分片的数据，从当前的 M 个集群重新划分（re-partition）到 N 个集群</strong>？无论怎样划分，<strong>每个分片的全部数据始终只属于一个集群</strong>（分片是迁移与归属的最小单位，不会被拆开）。
+  </div>
+  <p>围绕这个问题，本文档需要详尽回答两件事（也是相较旧版设计需要补强的重点）：</p>
+  <ol>
+    <li><strong>重新划分后，某个分片的数据如何迁移</strong>——从源集群搬到目标集群的完整协议（第 <a class="ref" href="#s6">6</a> 节）。</li>
+    <li><strong>正在被迁移的分片，其读写请求如何处理</strong>——迁移窗口内不丢、不重、不断流的读写路由（第 <a class="ref" href="#s7">7</a> 节）。</li>
+  </ol>
 
   <h3>设计目标</h3>
   <table>
     <tr><th style="width:26%">目标</th><th>说明</th></tr>
-    <tr><td><span class="pill new">分片数动态化</span></td><td>分片（shard）数量可在运行时增加/减少（分裂 Split / 合并 Merge），而不是编译期固定的 4096。</td></tr>
-    <tr><td><span class="pill new">集群弹性伸缩</span></td><td>可在线新增（scale-out）与下线（scale-in）OS 集群，并自动触发分片重平衡。</td></tr>
-    <tr><td><span class="pill new">在线数据迁移</span></td><td>迁移在后台增量进行，<strong>不断流</strong>：读写请求全程可服务。</td></tr>
+    <tr><td><span class="pill new">集群数动态化</span></td><td>集群数量可在运行时从 M 变为 N（扩容 scale-out / 缩容 scale-in），无需停机重建。</td></tr>
+    <tr><td><span class="pill new">分片重划分</span></td><td>集群数变化后，OM 自动重算 <em>shard → cluster</em> 映射，仅迁移<strong>归属发生变化</strong>的分片，迁移量最小化。</td></tr>
+    <tr><td><span class="pill new">分片不可拆</span></td><td>分片总数恒为 4096；每个分片作为整体迁移，任一时刻只归属一个集群。</td></tr>
+    <tr><td><span class="pill new">在线数据迁移</span></td><td>迁移在后台增量进行，<strong>不断流</strong>：迁移中分片的读写请求全程可服务。</td></tr>
     <tr><td><span class="pill new">强一致保障</span></td><td>迁移过程中不丢失、不重复、不产生"读旧写新"错乱；沿用 Goblin 的强一致语义。</td></tr>
-    <tr><td><span class="pill new">高可用</span></td><td>任一步骤失败可回滚/重试；协调者与参与者宕机不破坏正确性。</td></tr>
+    <tr><td><span class="pill new">高可用</span></td><td>任一步骤失败可回滚/重试；协调者（OM）与参与者（OS）宕机不破坏正确性。</td></tr>
   </table>
 
   <h3>非目标（Non-Goals）</h3>
   <ul>
+    <li><strong>不改变分片总数（4096）、不做 shard 分裂/合并（Split/Merge）</strong>——分片粒度固定，本方案只调整分片到集群的归属。</li>
     <li>不改变 Goblin 单集群内部的 Raft 复制机制与 event-sourcing 模型。</li>
-    <li>不在本方案实现跨分片分布式事务（现状即不支持跨集群事务，保持一致）。</li>
+    <li>不在本方案实现跨分片/跨集群分布式事务（现状即不支持，保持一致）。</li>
     <li>不引入外部协调服务（如独立 ZooKeeper/etcd）；复用 OM 作为元数据与协调中枢。</li>
   </ul>
 </section>
@@ -213,12 +229,15 @@
   <div class="callout danger">
     <span class="tag">Gap</span>
     <ol style="margin-bottom:0">
-      <li><strong>分片数硬编码</strong>：<code>Shard::DEFAULT=12</code> 与 <code>RING_LENGTH=4096</code> 编译期固定，无法改变分片粒度，热点分片无法进一步细分。</li>
-      <li><strong>重平衡链路断开</strong>：<code>onboardCluster()</code> 里生成迁移任务的代码被注释，新集群加入后不会真正迁移数据。</li>
-      <li><strong>服务端 <code>MigrateBatch</code> 缺失</strong>：导出方能发，但接收方没有 CallData，迁移无法闭环。</li>
-      <li><strong>并发迁移受限</strong>：<code>fillRouteAndMigrationInfo()</code> 假设"同一时刻只有一个迁移任务"。</li>
+      <li><strong>重平衡链路断开</strong>：<code>onboardCluster()</code> 里"新增集群后生成迁移任务"的代码被整段注释（注释写着 <em>"Skip migration as only static sharding is supported currently"</em>），新集群加入后 HashRing 虽已算出待迁分片，但不会真正迁移数据。<span class="pill src">ClusterSetManager.cpp:412-433</span></li>
+      <li><strong>缩容未实现</strong>：<code>removeCluster()</code> 为空，无法在线下线集群并把其分片迁走。</li>
+      <li><strong>服务端 <code>MigrateBatch</code> 缺失</strong>：导出方 <code>ExportTask</code> 能通过 <code>migrateBatch()</code> 发送批数据，但 <code>RequestReceiver</code> 未注册 <code>MigrateBatchCallData</code>，接收方无处落地，迁移无法闭环。<span class="pill src">RequestReceiver.cpp:76-84</span></li>
+      <li><strong>并发迁移受限</strong>：<code>fillRouteAndMigrationInfo()</code> 明确假设"同一时刻只有一个迁移任务"（<code>currently, there are only one migration in process</code>）；一次扩缩容通常涉及多个源集群，需要支持多任务并发。</li>
     </ol>
   </div>
+  <div class="callout good">
+    <span class="tag">好消息</span>
+    迁移所需的<strong>核心一致性原语已经存在且可复用</strong>：per-shard 扫描/导出/删除（<code>MigrationManager</code>）、迁移进度上报（<code>reportMigration</code>）、以及最关键的<strong>迁移期读写路由判定</strong>（<code>preExecuteCallBack</code> 已实现 <code>IMPORTING</code>/<code>EXPORTING</code> 双向处理与 <code>MIGRATED_ROUTE</code> 重定向）。本方案的工作主要是<strong>打通编排链路</strong>，而非从零构建一致性机制。</div>
 </section>
 
 <!-- ============ 3 ============ -->
@@ -236,7 +255,7 @@
   </table>
   <div class="callout good">
     <span class="tag">结论</span>
-    Goblin 现状最接近 <strong>Redis Cluster（大粒度逻辑槽 + 客户端重定向）</strong>；已具备 <code>routeVersion</code>、<code>MIGRATED_ROUTE</code>、per-shard 迁移原语。因此本方案以 <strong>"可分裂的逻辑槽"</strong> 为骨架，融合 <strong>Vitess 的"先复制后切流"</strong> 与 <strong>TiKV 的"中心调度 + Split/Merge"</strong>，最大程度复用已有代码。
+    本方案与 <strong>Redis Cluster</strong> 的模型最为契合：<strong>逻辑分片数固定（Redis 16384 槽 / Goblin 4096 分片），只改变"分片 → 节点/集群"的映射</strong>，并用客户端重定向（Redis <code>MOVED/ASK</code> ≈ Goblin <code>MIGRATED_ROUTE</code>）承接迁移期请求。同时借鉴 <strong>Vitess "先复制后切流、增量追平、可回退"</strong> 保证迁移不断流。<b>不采用 TiKV/HBase 的 Split/Merge</b>——因为本需求明确固定分片粒度，只调整集群数量。Goblin 已具备 <code>routeVersion</code> 栅栏、<code>MIGRATED_ROUTE</code> 重定向与 per-shard 迁移原语，落地成本低。
   </div>
 </section>
 
@@ -245,377 +264,382 @@
   <h2><span class="num">4</span>设计总览</h2>
 
   <h3 id="s4-1">4.1 核心思想</h3>
-  <p>把"分片数动态变化"拆解为<strong>两个正交维度</strong>，分别独立演进、组合使用：</p>
-  <div class="grid2">
-    <div class="callout">
-      <span class="tag">维度 A · 放置伸缩（Placement）</span>
-      <p style="margin:6px 0 0">改变 <em>shard → cluster</em> 映射：新增/下线集群时，把部分 shard 从源集群搬到目标集群。<b>分片总数不变</b>，仅改变归属。复用现有 HashRing + 迁移原语即可打通。</p>
-    </div>
-    <div class="callout">
-      <span class="tag">维度 B · 粒度伸缩（Granularity）</span>
-      <p style="margin:6px 0 0">改变 <em>key → shard</em> 的分片总数：对某分片做 <b>Split（一分为二）</b> 或对相邻分片做 <b>Merge（合二为一）</b>。这是真正意义上的"shard 个数动态变化"。</p>
-    </div>
-  </div>
-  <p>两者共享同一套<strong>在线迁移协议</strong>（第 6 节）与<strong>路由版本栅栏</strong>，从而以统一机制保证不断流。</p>
-
-  <h3 id="s4-2">4.2 分层分片模型</h3>
-  <p>引入<strong>"逻辑槽（logical slot）+ 动态分片位（dynamic shard bits）"</strong>模型，替代固定的 <code>2<sup>12</sup></code>：</p>
+  <p>整个方案只围绕<strong>一个可变量</strong>展开：<em>shard → cluster</em> 的映射。key→shard（4096 固定）与 shard→column family 都保持不变。集群数从 M 变到 N，本质上是三步：</p>
   <div class="fig">
-    <svg viewBox="0 0 1000 300" width="100%" role="img" aria-label="分层分片模型">
-      <!-- key -->
-      <rect x="30" y="30" width="160" height="46" rx="8" fill="#1e2740" stroke="#2b3855"/>
-      <text x="110" y="58" fill="#e7ecf5" font-size="14" text-anchor="middle">hash(key) 64bit</text>
-      <!-- slot -->
-      <rect x="30" y="120" width="420" height="70" rx="10" fill="#12233a" stroke="#2b3855"/>
-      <text x="240" y="148" fill="#8fc3ff" font-size="14" text-anchor="middle">高位 M 位 → 逻辑槽 SlotId ∈ [0, 2^M)</text>
-      <text x="240" y="170" fill="#9fb0cd" font-size="11.5" text-anchor="middle">M 恒定（如 14 → 16384 槽），保证路由稳定、客户端零改动</text>
-      <!-- shard bits -->
-      <rect x="480" y="120" width="490" height="70" rx="10" fill="#2b2412" stroke="#2b3855"/>
-      <text x="725" y="148" fill="#ffd98a" font-size="14" text-anchor="middle">每个槽维护 splitDepth d（可变）</text>
-      <text x="725" y="170" fill="#9fb0cd" font-size="11.5" text-anchor="middle">ShardId = (SlotId, 后 d 位)　→ 分片总数 = Σ 2^d(slot)</text>
-      <!-- arrows -->
-      <defs><marker id="ar2" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#4da3ff"/></marker></defs>
-      <line x1="110" y1="78" x2="110" y2="116" stroke="#4da3ff" stroke-width="2" marker-end="url(#ar2)"/>
-      <line x1="450" y1="155" x2="476" y2="155" stroke="#4da3ff" stroke-width="2" marker-end="url(#ar2)"/>
-      <!-- cluster -->
-      <rect x="200" y="240" width="600" height="44" rx="8" fill="#122b1c" stroke="#2b3855"/>
-      <text x="500" y="267" fill="#8fe0a3" font-size="13" text-anchor="middle">Shard → Cluster：一致性哈希（HashRing 作用在 ShardId 空间）</text>
-      <line x1="240" y1="190" x2="360" y2="236" stroke="#4da3ff" stroke-width="2" marker-end="url(#ar2)"/>
-      <line x1="725" y1="190" x2="620" y2="236" stroke="#4da3ff" stroke-width="2" marker-end="url(#ar2)"/>
+    <svg viewBox="0 0 1000 210" width="100%" role="img" aria-label="重新划分三步">
+      <defs><marker id="arv" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#4da3ff"/></marker></defs>
+      <g font-size="13" text-anchor="middle">
+        <rect x="30" y="70" width="230" height="72" rx="12" fill="#12233a" stroke="#2b3855"/>
+        <text x="145" y="100" fill="#8fc3ff">① 重算映射</text>
+        <text x="145" y="122" fill="#9fb0cd" font-size="11.5">HashRing 增/删集群节点</text>
+        <rect x="385" y="70" width="230" height="72" rx="12" fill="#2b2412" stroke="#2b3855"/>
+        <text x="500" y="100" fill="#ffd98a">② 差异 → 迁移计划</text>
+        <text x="500" y="122" fill="#9fb0cd" font-size="11.5">仅归属变化的分片</text>
+        <rect x="740" y="70" width="230" height="72" rx="12" fill="#122b1c" stroke="#2b3855"/>
+        <text x="855" y="100" fill="#8fe0a3">③ 逐分片在线迁移</text>
+        <text x="855" y="122" fill="#9fb0cd" font-size="11.5">复制→追平→原子切流</text>
+      </g>
+      <line x1="262" y1="106" x2="381" y2="106" stroke="#4da3ff" stroke-width="2" marker-end="url(#arv)"/>
+      <line x1="617" y1="106" x2="736" y2="106" stroke="#4da3ff" stroke-width="2" marker-end="url(#arv)"/>
+      <text x="500" y="40" fill="#9fb0cd" font-size="12" text-anchor="middle">分片总数 4096 恒定；只有"哪个分片归哪个集群"在变</text>
     </svg>
-    <div class="cap">图 4-1　逻辑槽（稳定路由锚点）+ 每槽可变分裂深度（动态粒度）</div>
+    <div class="cap">图 4-1　集群数 M→N 的三步：重算映射 → 计算差异 → 逐分片迁移</div>
   </div>
-  <div class="callout good">
-    <span class="tag">为什么这样分层</span>
-    逻辑槽 <code>M</code> 保持恒定 → <strong>客户端路由算法与 <code>RouteInfo</code> 结构基本不变</strong>；粒度变化被封装在"槽内分裂深度"里，只影响服务端列族与迁移单元。这样"分片数动态变化"不会破坏客户端与已有 4096→16384 路由假设，改造面最小、风险最低。
-  </div>
+  <ul>
+    <li><strong>分片是迁移的最小单位</strong>：一个分片的所有 key 要么全在源集群，要么全在目标集群，切流是分片级原子事件——这天然满足"每个分片只属于一个集群"的不变式。</li>
+    <li><strong>一致性哈希最小化迁移</strong>：M→N 时，绝大多数分片归属不变；一致性哈希（含虚拟节点）保证只有约 <code>Δ = |迁移分片| ≈ 4096 × (1 − M/N)</code>（扩容）个分片需要搬迁，避免全量重排。</li>
+    <li><strong>复用统一迁移协议</strong>：无论扩容还是缩容，每个"归属改变的分片"都走同一套四阶段在线迁移协议（第 6 节）与同一套路由栅栏（第 7 节）。</li>
+  </ul>
 
-  <h3 id="s4-3">4.3 组件职责</h3>
+  <h3 id="s4-2">4.2 组件职责</h3>
   <table>
     <tr><th>组件</th><th>新增/变更职责</th></tr>
-    <tr><td><strong>OM · ShardCatalog</strong> <span class="pill new">新增</span></td><td>全局分片目录：记录每个 slot 的 <code>splitDepth</code>、每个 shard 的状态（Normal/Splitting/Merging/Migrating）与归属集群；作为迁移的<strong>唯一真相源</strong>。</td></tr>
-    <tr><td><strong>OM · Rebalancer</strong> <span class="pill new">新增</span></td><td>调度器：根据触发信号（扩缩容/热点/容量）产出<strong>迁移计划</strong>（一组 MigrationTask），驱动状态机推进，支持并发多任务。</td></tr>
-    <tr><td><strong>OM · ClusterSetManager</strong> <span class="pill chg">打通</span></td><td>接通 <code>onboardCluster()</code> 中被注释的重平衡逻辑；实现 <code>removeCluster()</code>；驱动 Split/Merge。</td></tr>
-    <tr><td><strong>OS · MigrationManager</strong> <span class="pill chg">增强</span></td><td>支持"分片子集"迁移与"槽内 range"迁移；补齐 <code>MigrateBatch</code> 服务端 CallData；支持并发多任务与断点续传。</td></tr>
-    <tr><td><strong>OS · preExecuteCallBack</strong> <span class="pill chg">扩展</span></td><td>在既有路由栅栏基础上，增加 Split/Merge 期间的双活读写判定。</td></tr>
-    <tr><td><strong>Client · ShardingInfo</strong> <span class="pill chg">小改</span></td><td>把 <code>shardFactor</code> 常量替换为 <code>RouteInfo</code> 下发的每槽分裂深度；重定向逻辑已具备。</td></tr>
+    <tr><td><strong>OM · ClusterSetManager</strong> <span class="pill chg">打通</span></td><td>接通 <code>onboardCluster()</code> 中被注释的重平衡逻辑（扩容）；实现 <code>removeCluster()</code>（缩容）；据 HashRing 差异生成一组 <code>MigrationTask</code> 并以 Raft 事务持久化。<span class="pill src">ClusterSetManager.cpp:395-439</span></td></tr>
+    <tr><td><strong>OM · HashRing</strong> <span class="pill chg">复用</span></td><td><code>addClusterId(&amp;map)</code> 已能算出"新集群将从哪些旧集群接管哪些分片"；<code>deleteClusterId()</code> 支持缩容重排。作为 <em>shard→cluster</em> 的唯一计算源。<span class="pill src">HashRing.cpp:55-135</span></td></tr>
+    <tr><td><strong>OM · Rebalancer</strong> <span class="pill new">新增（薄层）</span></td><td>把一次扩缩容拆解为多个<strong>并发</strong>迁移任务并驱动其状态机推进；限制全局并发度、支持失败重试与整体回滚。</td></tr>
+    <tr><td><strong>OS · MigrationManager</strong> <span class="pill chg">增强</span></td><td>已实现按分片 <code>ScanTask→ExportTask</code>（导出→删除）；需补齐 <code>MigrateBatch</code> <strong>服务端 CallData</strong>，并支持并发多任务与断点续传。<span class="pill src">MigrationManager.cpp:35-165</span></td></tr>
+    <tr><td><strong>OS · preExecuteCallBack</strong> <span class="pill new">复用</span></td><td>迁移期读写路由判定<strong>已实现</strong>：路由版本栅栏 + <code>IMPORTING</code>（接管中分片放行）/<code>EXPORTING</code>（已迁 key 回 <code>MIGRATED_ROUTE</code>）。第 7 节详述。<span class="pill src">ObjectStore.cpp:109-191</span></td></tr>
+    <tr><td><strong>Client · ShardingInfo</strong> <span class="pill new">无需改</span></td><td>key→shard 算法与 4096 分片假设不变；仅需按 <code>RouteInfo.routeVersion</code> 刷新 <em>shard→cluster</em> 映射并处理重定向（现有能力）。</td></tr>
   </table>
 </section>
 
 <!-- ============ 5 ============ -->
 <section id="s5">
-  <h2><span class="num">5</span>动态分片模型详解</h2>
+  <h2><span class="num">5</span>分片重新划分（Re-partition）</h2>
 
-  <h3 id="s5-1">5.1 逻辑槽 vs 物理分片</h3>
-  <p>定义（<code>M</code> 为常量槽位数，如 14；<code>d(s)</code> 为槽 <code>s</code> 的分裂深度）：</p>
-  <pre><code>SlotId  = hash(key) >> (64 - M)                 // 稳定：客户端一致性路由锚点
-subBits = (hash(key) >> (64 - M - d)) &amp; ((1&lt;&lt;d)-1)  // 槽内子分片选择位
-ShardId = encode(SlotId, d, subBits)            // 全局唯一物理分片号
-                                                 // d=0 → 整槽一个分片（默认）</code></pre>
-  <ul>
-    <li><strong>默认 <code>d=0</code></strong>：等价于当前"一个槽=一个分片"，与现状 4096/16384 分片行为一致，<strong>平滑兼容</strong>。</li>
-    <li><strong>分裂</strong>：<code>d → d+1</code>，一个分片按 <code>subBits</code> 最高位裂成两个子分片，可独立放置到不同集群。</li>
-    <li><strong>合并</strong>：相邻兄弟子分片 <code>d → d-1</code> 合回父分片。</li>
-    <li><code>ShardId</code> 采用可解析编码（如 <code>SlotId 高位 | depth | subBits</code>），使 <code>shardIdToColumnFamily()</code> 与 HashRing 都能从中恢复分裂层级。</li>
-  </ul>
-  <div class="callout">
-    <span class="tag">兼容性</span>
-    当所有槽 <code>d=0</code> 时，本模型的 <code>ShardId</code> 空间与列族映射可退化为现有 <code>hash &amp; (2^M-1)</code>，因此升级过程可"零迁移"从静态分片切换到动态分片模型。
+  <h3 id="s5-1">5.1 划分不变式</h3>
+  <p>无论 M→N 如何变化，系统始终维持以下不变式：</p>
+  <div class="callout good">
+    <span class="tag">Invariants</span>
+    <ol style="margin:6px 0 0">
+      <li><b>I1 · 全覆盖</b>：4096 个分片的并集恰好覆盖整个 key 空间，无空洞、无重叠。</li>
+      <li><b>I2 · 单一归属</b>：任一时刻，每个分片<strong>恰好</strong>归属一个集群（迁移中的分片有唯一"权威集群"，见 6.3/7）。</li>
+      <li><b>I3 · 整体迁移</b>：分片是迁移的最小单位，其 key 集合不被拆分到两个集群。</li>
+      <li><b>I4 · 版本单调</b>：每次归属变更都伴随 <code>routeVersion</code> 单调递增，作为新旧视图的分界。</li>
+    </ol>
   </div>
 
-  <h3 id="s5-2">5.2 Shard 分裂（Split）</h3>
-  <p>触发条件（任一，由 Rebalancer 评估）：分片数据量/键数超阈值、写入 QPS 热点、目标集群需要更细粒度以承接迁移。</p>
+  <h3 id="s5-2">5.2 扩容：M → N（N &gt; M）</h3>
+  <p>新增集群时，OM 复用一致性哈希 <code>HashRing</code> 计算需要接管的分片，只迁移这部分，其余分片原地不动。</p>
   <div class="fig">
-    <svg viewBox="0 0 1000 260" width="100%" role="img" aria-label="分片分裂流程">
-      <defs><marker id="ar3" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#7bd88f"/></marker></defs>
-      <!-- states -->
-      <g font-size="12.5" text-anchor="middle">
-        <rect x="20" y="100" width="150" height="56" rx="10" fill="#122b1c" stroke="#2b3855"/>
-        <text x="95" y="124" fill="#8fe0a3">Shard S</text><text x="95" y="142" fill="#9fb0cd">Normal (d)</text>
-        <rect x="230" y="100" width="150" height="56" rx="10" fill="#12233a" stroke="#2b3855"/>
-        <text x="305" y="124" fill="#8fc3ff">Split Prepared</text><text x="305" y="142" fill="#9fb0cd">S0,S1 (d+1)</text>
-        <rect x="440" y="100" width="160" height="56" rx="10" fill="#2b2412" stroke="#2b3855"/>
-        <text x="520" y="124" fill="#ffd98a">Copy &amp; Dual-Write</text><text x="520" y="142" fill="#9fb0cd">追平增量</text>
-        <rect x="660" y="100" width="150" height="56" rx="10" fill="#12233a" stroke="#2b3855"/>
-        <text x="735" y="124" fill="#8fc3ff">Switch (原子)</text><text x="735" y="142" fill="#9fb0cd">routeVer++</text>
-        <rect x="860" y="100" width="120" height="56" rx="10" fill="#122b1c" stroke="#2b3855"/>
-        <text x="920" y="124" fill="#8fe0a3">Normal</text><text x="920" y="142" fill="#9fb0cd">S0,S1 生效</text>
+    <svg viewBox="0 0 1000 250" width="100%" role="img" aria-label="扩容重新划分">
+      <defs><marker id="are" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#7bd88f"/></marker></defs>
+      <text x="500" y="26" fill="#9fb0cd" font-size="12" text-anchor="middle">M=2 → N=3：仅 C1/C2 各让出一段连续分片给新集群 C3，其余不动</text>
+      <!-- ring before -->
+      <g font-size="11.5" text-anchor="middle">
+        <text x="220" y="60" fill="#cfe0ff" font-size="13">划分前（M=2）</text>
+        <rect x="70" y="80" width="140" height="46" rx="8" fill="#122b1c" stroke="#2b3855"/><text x="140" y="102" fill="#8fe0a3">C1</text><text x="140" y="118" fill="#9fb0cd">shards [0,2047]</text>
+        <rect x="230" y="80" width="140" height="46" rx="8" fill="#122b1c" stroke="#2b3855"/><text x="300" y="102" fill="#8fe0a3">C2</text><text x="300" y="118" fill="#9fb0cd">shards [2048,4095]</text>
       </g>
-      <g stroke="#7bd88f" stroke-width="2">
-        <line x1="172" y1="128" x2="226" y2="128" marker-end="url(#ar3)"/>
-        <line x1="382" y1="128" x2="436" y2="128" marker-end="url(#ar3)"/>
-        <line x1="602" y1="128" x2="656" y2="128" marker-end="url(#ar3)"/>
-        <line x1="812" y1="128" x2="856" y2="128" marker-end="url(#ar3)"/>
+      <!-- ring after -->
+      <g font-size="11.5" text-anchor="middle">
+        <text x="220" y="165" fill="#cfe0ff" font-size="13">划分后（N=3）</text>
+        <rect x="60" y="185" width="120" height="46" rx="8" fill="#122b1c" stroke="#2b3855"/><text x="120" y="207" fill="#8fe0a3">C1</text><text x="120" y="223" fill="#9fb0cd">保留大部</text>
+        <rect x="195" y="185" width="120" height="46" rx="8" fill="#122b1c" stroke="#2b3855"/><text x="255" y="207" fill="#8fe0a3">C2</text><text x="255" y="223" fill="#9fb0cd">保留大部</text>
+        <rect x="330" y="185" width="150" height="46" rx="8" fill="#2b2412" stroke="#2b3855"/><text x="405" y="207" fill="#ffd98a">C3（新）</text><text x="405" y="223" fill="#9fb0cd">接管两段</text>
       </g>
-      <text x="500" y="40" fill="#9fb0cd" font-size="12" text-anchor="middle">分裂全程 S 持续对外读写；仅在最后 Switch 一瞬做原子路由切换</text>
+      <line x1="140" y1="128" x2="380" y2="183" stroke="#7bd88f" stroke-width="2" marker-end="url(#are)"/>
+      <line x1="300" y1="128" x2="420" y2="183" stroke="#7bd88f" stroke-width="2" marker-end="url(#are)"/>
+      <!-- code note -->
+      <g font-size="11.5" text-anchor="start" fill="#9fb0cd">
+        <rect x="560" y="70" width="410" height="160" rx="10" fill="#0b1020" stroke="#2b3855"/>
+        <text x="580" y="96" fill="#a8d5ff" font-size="12">HashRing::addClusterId(C3, &amp;clusterShardMap)</text>
+        <text x="580" y="120">→ clusterShardMap = {</text>
+        <text x="600" y="142">  C1: [从 C1 让出的分片…],</text>
+        <text x="600" y="164">  C2: [从 C2 让出的分片…]</text>
+        <text x="580" y="186">}  // key=源集群, value=迁往 C3 的分片</text>
+        <text x="580" y="212" fill="#8fe0a3">仅这些分片进入迁移；未列出的分片零成本</text>
+      </g>
     </svg>
-    <div class="cap">图 5-1　Shard 分裂状态机（不断流）</div>
+    <div class="cap">图 5-1　扩容：HashRing 直接算出"哪些源集群的哪些分片需迁往新集群"</div>
   </div>
   <ol>
-    <li><strong>Prepare</strong>：OM 在 ShardCatalog 中将 <code>d→d+1</code>，登记子分片 <code>S0/S1</code>（初始与 <code>S</code> 同集群，或指定目标集群），状态置 <code>SPLITTING</code>，但<strong>暂不提升 routeVersion</strong>（客户端仍按父分片 <code>S</code> 路由）。</li>
-    <li><strong>Copy</strong>：若子分片需迁到别的集群，走在线迁移协议（第 6 节）复制存量数据。若原地分裂（同集群、仅拆列族），则只需重打列族标签，无跨网络拷贝。</li>
-    <li><strong>Dual-Write 追平</strong>：Copy 期间对 <code>S</code> 的新写入，按新的 <code>subBits</code> 同步落到 <code>S0/S1</code>，保证增量不丢（详见 6.2）。</li>
-    <li><strong>Switch</strong>：追平后，OM 在一个 Raft 事务里原子地把 <code>S0/S1</code> 置 <code>NORMAL</code>、更新 placement、<code>routeVersion++</code>。客户端下次请求即感知新路由。</li>
-    <li><strong>Cleanup</strong>：源分片 <code>S</code> 的冗余副本/旧列族被回收。</li>
+    <li><strong>登记集群</strong>：<code>onboardCluster()</code> 把新集群置 <code>IN_SERVICE</code>，并对已在环上的集群与新集群调用 <code>addClusterId()</code>。</li>
+    <li><strong>算差异</strong>：<code>addClusterId(newId, &amp;clusterShardMap)</code> 返回 <code>map&lt;源集群, 待迁分片[]&gt;</code>——正是"从哪迁、迁哪些"。<span class="pill src">HashRing.cpp:66-102</span></li>
+    <li><strong>生成迁移任务</strong>：对 map 中<strong>每个源集群</strong>创建一个 <code>MigrationTask</code>（源→新集群 + 分片列表），源集群置 <code>EXPORTING</code>，新集群置 <code>IMPORTING</code>；整批在一个 OM Raft 事务中持久化（打通 <code>onboardCluster()</code> 中现被注释的这段逻辑）。<span class="pill src">ClusterSetManager.cpp:412-433</span></li>
+    <li><strong>并发迁移</strong>：多个源集群的任务并行推进（需解除"单任务"假设，见第 9 节）。</li>
   </ol>
 
-  <h3 id="s5-3">5.3 Shard 合并（Merge）</h3>
-  <p>触发条件：相邻兄弟分片长期低负载、集群缩容需要归并碎片。合并是分裂的逆过程，同样不断流：</p>
+  <h3 id="s5-3">5.3 缩容：M → N（N &lt; M）</h3>
+  <p>缩容是扩容的镜像：把待下线集群持有的分片全部迁往保留集群，然后从环上摘除该集群。</p>
   <ol>
-    <li><strong>Prepare</strong>：选定同一父槽下的兄弟对 <code>S0/S1</code>（<code>d</code> 相同、前缀相邻），登记父分片 <code>S(d-1)</code>，状态 <code>MERGING</code>。</li>
-    <li><strong>Colocate &amp; Copy</strong>：若二者不在同一集群，先把其中一个迁到另一个所在集群（复用迁移协议），使数据物理同址。</li>
-    <li><strong>Dual-Write 追平</strong>：合并期对 <code>S0/S1</code> 的写入同时写入父分片视图。</li>
-    <li><strong>Switch</strong>：原子将 <code>S0/S1 → S(d-1)</code>，<code>d--</code>，<code>routeVersion++</code>。</li>
+    <li><strong>标记下线</strong>：<code>removeCluster()</code>（当前为空，需实现）把目标集群置 <code>EXPORTING</code>，停止其接收新分片。</li>
+    <li><strong>重算落点</strong>：<code>HashRing::deleteClusterId(id)</code> 从环上删除该集群的所有虚拟节点；再用 <code>extractShardConfig()</code> 反推新的 <em>cluster→shard[]</em>，得出该集群原持分片的新归属（一致性哈希保证只在相邻集群间重排）。<span class="pill src">HashRing.cpp:55-64,107-135</span></li>
+    <li><strong>生成迁移任务</strong>：待下线集群作为源，其分片按新落点分组，为每个目标集群建一个迁移任务；目标集群置 <code>IMPORTING</code>。</li>
+    <li><strong>确认后摘除</strong>：所有分片迁移完成（<code>routeVersion++</code> 生效、无残留请求）后，才真正将该集群置 <code>OUT_OF_SERVICE</code> 并从集群集合移除。</li>
   </ol>
   <div class="callout warn">
-    <span class="tag">约束</span>
-    只允许合并"同父、同深度、前缀相邻"的兄弟分片（buddy-merge），保证 <code>ShardId</code> 编码可逆、避免 range 空洞。这是从 Redis/TiKV 合并约束中提炼的安全规则。
+    <span class="tag">安全序</span>
+    缩容必须<strong>先迁空、再摘除</strong>：只有当下线集群不再是任何分片的权威集群、且客户端路由都已刷新到不指向它之后，才能停机。中途任一步失败都可回滚（保持其 <code>EXPORTING</code> 或退回 <code>IN_SERVICE</code>）。
   </div>
 
-  <h3 id="s5-4">5.4 元数据与状态机</h3>
-  <p>ShardCatalog 中每个 Shard 的生命周期状态：</p>
+  <h3 id="s5-4">5.4 迁移计划与状态机</h3>
+  <p>一次扩缩容 = 一个<strong>迁移计划</strong>（Plan）= 一组按源集群拆分的 <code>MigrationTask</code>。每个任务覆盖若干分片，其生命周期由 OM 以 Raft 事务持久化，因而 100% 可复现、可断点续跑（复用 Goblin event-sourcing）。</p>
   <div class="fig">
-    <svg viewBox="0 0 980 220" width="100%" role="img" aria-label="分片状态机">
-      <defs><marker id="ar4" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#4da3ff"/></marker></defs>
+    <svg viewBox="0 0 980 210" width="100%" role="img" aria-label="迁移任务状态机">
+      <defs><marker id="ars" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#4da3ff"/></marker></defs>
       <g font-size="12" text-anchor="middle">
-        <ellipse cx="120" cy="110" rx="72" ry="34" fill="#122b1c" stroke="#2b3855"/><text x="120" y="114" fill="#8fe0a3">NORMAL</text>
-        <ellipse cx="360" cy="45" rx="80" ry="30" fill="#12233a" stroke="#2b3855"/><text x="360" y="49" fill="#8fc3ff">SPLITTING</text>
-        <ellipse cx="360" cy="175" rx="80" ry="30" fill="#12233a" stroke="#2b3855"/><text x="360" y="179" fill="#8fc3ff">MERGING</text>
-        <ellipse cx="620" cy="110" rx="82" ry="32" fill="#2b2412" stroke="#2b3855"/><text x="620" y="114" fill="#ffd98a">MIGRATING</text>
-        <ellipse cx="860" cy="110" rx="72" ry="32" fill="#122b1c" stroke="#2b3855"/><text x="860" y="114" fill="#8fe0a3">NORMAL'</text>
+        <ellipse cx="90" cy="105" rx="66" ry="30" fill="#171e2e" stroke="#2b3855"/><text x="90" y="102" fill="#9fb0cd">NOT_START</text><text x="90" y="120" fill="#9fb0cd" font-size="10">归属未变</text>
+        <ellipse cx="290" cy="105" rx="72" ry="30" fill="#2b2412" stroke="#2b3855"/><text x="290" y="102" fill="#ffd98a">COPYING</text><text x="290" y="120" fill="#9fb0cd" font-size="10">P1 快照复制</text>
+        <ellipse cx="500" cy="105" rx="72" ry="30" fill="#2b2412" stroke="#2b3855"/><text x="500" y="102" fill="#ffd98a">CATCHUP</text><text x="500" y="120" fill="#9fb0cd" font-size="10">P2 增量追平</text>
+        <ellipse cx="710" cy="105" rx="72" ry="30" fill="#12233a" stroke="#2b3855"/><text x="710" y="102" fill="#8fc3ff">SWITCHING</text><text x="710" y="120" fill="#9fb0cd" font-size="10">P3 原子切流</text>
+        <ellipse cx="905" cy="105" rx="60" ry="30" fill="#122b1c" stroke="#2b3855"/><text x="905" y="102" fill="#8fe0a3">DONE</text><text x="905" y="120" fill="#9fb0cd" font-size="10">P4 清理</text>
       </g>
       <g stroke="#4da3ff" stroke-width="2" fill="none">
-        <path d="M175,92 Q265,55 285,52" marker-end="url(#ar4)"/>
-        <path d="M175,128 Q265,165 285,168" marker-end="url(#ar4)"/>
-        <path d="M435,58 Q520,80 545,95" marker-end="url(#ar4)"/>
-        <path d="M435,162 Q520,140 545,125" marker-end="url(#ar4)"/>
-        <path d="M702,110 L785,110" marker-end="url(#ar4)"/>
-        <path d="M620,142 Q620,205 360,205 Q150,205 120,146" marker-end="url(#ar4)" stroke-dasharray="5 5"/>
+        <line x1="156" y1="105" x2="216" y2="105" marker-end="url(#ars)"/>
+        <line x1="362" y1="105" x2="426" y2="105" marker-end="url(#ars)"/>
+        <line x1="572" y1="105" x2="636" y2="105" marker-end="url(#ars)"/>
+        <line x1="782" y1="105" x2="843" y2="105" marker-end="url(#ars)"/>
+        <path d="M500,135 Q500,190 90,190 Q90,160 90,137" stroke-dasharray="5 5" marker-end="url(#ars)"/>
       </g>
-      <text x="470" y="212" fill="#9fb0cd" font-size="11" text-anchor="middle">虚线：失败回滚（任意中间态可安全回到 NORMAL）</text>
+      <text x="300" y="185" fill="#9fb0cd" font-size="11" text-anchor="middle">虚线：切流前任意阶段失败均可安全回滚到 NOT_START（routeVersion 未提升）</text>
     </svg>
-    <div class="cap">图 5-2　Shard 状态机（NORMAL 为唯一稳定态，所有中间态可回滚）</div>
+    <div class="cap">图 5-2　单个迁移任务的状态机（切流前可回滚，切流是唯一不可逆点）</div>
   </div>
-  <p>所有状态转换均以 OM Raft 事务持久化，天然具备 <strong>100% 状态可复现</strong>（复用 Goblin event-sourcing 特性）：OM 宕机重启后可从日志恢复迁移进度并续跑。</p>
 </section>
 
 <!-- ============ 6 ============ -->
 <section id="s6">
-  <h2><span class="num">6</span>在线迁移协议（不断流核心）</h2>
+  <h2><span class="num">6</span>分片数据迁移（如何搬一个分片）</h2>
+  <p>本节回答需求的第一问：<strong>重新划分后，某个分片的数据如何从源集群迁到目标集群</strong>。底层是一个<strong>四阶段协议</strong>，复用并强化现有 <code>MigrationManager</code>。</p>
 
-  <h3 id="s6-1">6.1 迁移阶段</h3>
-  <p>无论是 Placement 迁移、Split 还是 Merge，底层统一为一个<strong>四阶段迁移协议</strong>（复用并强化现有 <code>MigrationManager</code>）：</p>
+  <h3 id="s6-1">6.1 四阶段迁移协议</h3>
   <table>
-    <tr><th style="width:16%">阶段</th><th>动作</th><th>可用性</th></tr>
-    <tr><td><b>P1 Snapshot 复制</b></td><td>源集群 <code>ScanTask</code> 分批扫描迁移分片存量数据，经 <code>MigrateBatch</code> 写入目标集群（幂等 upsert，带 version）。</td><td>读写正常，全部由源集群服务。</td></tr>
-    <tr><td><b>P2 增量追平</b></td><td>源集群对迁移中分片开启<strong>变更转发/双写</strong>，把 P1 期间及之后的新写入同步到目标；直至 lag→0。</td><td>读写正常；写入额外转发一份。</td></tr>
-    <tr><td><b>P3 原子切流</b></td><td>OM 事务：迁移分片归属改为目标集群，<code>routeVersion++</code>，源标 <code>EXPORTING</code>→交出，目标标 <code>IMPORTING</code>→<code>IN_SERVICE</code>。</td><td>切换瞬间旧路由请求被 <code>MIGRATED_ROUTE</code>/<code>*_ROUTE_OUT_OF_DATE</code> 重定向重试，无失败。</td></tr>
-    <tr><td><b>P4 清理</b></td><td>源集群删除已迁数据（<code>deleteLocalKeys</code>），关闭双写；OM 移除迁移任务。</td><td>读写正常，全部由目标集群服务。</td></tr>
+    <tr><th style="width:15%">阶段</th><th>动作</th><th>数据权威</th></tr>
+    <tr><td><b>P1 · 快照复制</b><br><span class="pill" style="background:#2b2412;color:#ffd98a">COPYING</span></td><td>源集群 <code>ScanTask</code> 按 working set（列族）分批扫描迁移分片的存量数据（每批 <code>kScanMaxBatch=100</code>），<code>ExportTask::exportLocalKeys()</code> 打包为 <code>MigrateBatch</code> RPC 发往目标集群；目标以 <code>(key,version)</code> <strong>幂等 upsert</strong> 落库。<span class="pill src">MigrationManager.cpp:35-124</span></td><td><b>源集群</b>（读写全部由源服务）</td></tr>
+    <tr><td><b>P2 · 增量追平</b><br><span class="pill" style="background:#2b2412;color:#ffd98a">CATCHUP</span></td><td>P1 期间/之后源集群对该分片的新写入，需同步到目标（转发 <code>MigrateBatch</code>），直至 lag→0。同样按 <code>(key,version)</code> 幂等收敛。</td><td><b>源集群</b>（写入额外转发一份到目标）</td></tr>
+    <tr><td><b>P3 · 原子切流</b><br><span class="pill" style="background:#12233a;color:#8fc3ff">SWITCHING</span></td><td>OM 单条 Raft 事务：把该分片归属改为目标集群、<code>routeVersion++</code>；源集群对该分片从"服务"转为"重定向"。<span class="pill src">ClusterSetManager.cpp（EndMigration 路径）</span></td><td><b>切换瞬间</b>从源转移到目标</td></tr>
+    <tr><td><b>P4 · 清理</b><br><span class="pill" style="background:#122b1c;color:#8fe0a3">DONE</span></td><td>源集群 <code>deleteLocalKeys()</code> 删除已迁数据、关闭转发；OM 移除该迁移任务。<span class="pill src">MigrationManager.cpp:126-165</span></td><td><b>目标集群</b>（读写全部由目标服务）</td></tr>
   </table>
+  <p>现有 <code>ExportTask::run()</code> 已经是"<b>先导出、后删除</b>"的顺序（<code>exportLocalKeys()</code> 成功 ACK 后才 <code>deleteLocalKeys()</code>），这是不丢数据的关键。<span class="pill src">MigrationManager.cpp:84-88</span></p>
 
-  <h3 id="s6-2">6.2 不断流一致性机制</h3>
-  <p>关键在于 P2/P3 交界处如何保证"不丢、不重、不错序"。设计如下：</p>
+  <h3 id="s6-2">6.2 增量追平与"先复制后删除"窗口</h3>
   <div class="callout good">
-    <span class="tag">读路径</span>
+    <span class="tag">不丢（先复制后删除）</span>
     <ul style="margin:6px 0 0">
-      <li>切流前：由<strong>源集群</strong>服务（迁移分片仍归源）。</li>
-      <li>切流后：客户端持旧 routeVersion 命中源集群 → 源在 <code>preExecuteCallBack</code> 判定该 key 已迁走（本地 meta not found）→ 返回 <code>MIGRATED_ROUTE</code> + 目标地址，客户端立即重定向到目标（现状已实现）。<span class="pill src">ObjectStore.cpp:172-184</span></li>
+      <li><code>exportLocalKeys()</code> 内部对 <code>MigrateBatch</code> <strong>重试直到目标全部 ACK 成功</strong>才返回；随后 <code>deleteLocalKeys()</code> 才删源。目标未确认收到前，源数据绝不删除，杜绝"源已删、目标未收"空窗。<span class="pill src">MigrationManager.cpp:100-124</span></li>
+      <li>删除失败的 key 会被重新封装成新的 <code>ScanTask</code> 重新导出/删除，天然幂等收敛。<span class="pill src">MigrationManager.cpp:143-162</span></li>
     </ul>
   </div>
   <div class="callout good">
-    <span class="tag">写路径（双写 + 版本仲裁）</span>
+    <span class="tag">不重、乱序收敛（版本幂等）</span>
     <ul style="margin:6px 0 0">
-      <li>P2 期间，源集群对迁移分片的每次写，除本地 commit 外，异步转发 <code>MigrateBatch</code> 到目标；<code>MigrateBatch</code> 以 <strong>(key, version) 幂等</strong> 落库——目标已有更高 version 则忽略，保证 P1 快照与 P2 增量、以及乱序到达时以最新 version 收敛。</li>
-      <li>P3 切流用 OM 单条 Raft 事务完成，保证"源停止接受该分片写"与"目标开始接受"之间无重叠窗口；切流后源对该分片写入直接回重定向，不再本地落库。</li>
+      <li>每条 <code>MigrateBatch</code> 条目携带 <code>version</code>；目标落库时若已有更高 <code>version</code> 则忽略。于是 P1 快照与 P2 增量、以及网络乱序到达的多条写，都会收敛到最新版本。<span class="pill src">MigrationManager.cpp:88-108</span></li>
+      <li>需补齐的服务端 <code>MigrateBatchCallData</code> 必须落实这套幂等 upsert 语义（当前接收器缺失，是闭环关键）。<span class="pill src">RequestReceiver.cpp:76-84</span></li>
     </ul>
   </div>
-  <div class="callout warn">
-    <span class="tag">迁移中的写去哪</span>
-    为避免"源已删、目标未收"的空窗，采用 <b>先复制后删除</b>：<code>ExportTask</code> 先 <code>exportLocalKeys()</code> 确认目标 ACK 成功，<em>再</em> <code>deleteLocalKeys()</code>（现状顺序已如此）。删除失败的 key 会重新入 <code>ScanTask</code> 重试，天然幂等。<span class="pill src">MigrationManager.cpp:92-162</span>
-  </div>
 
-  <h3 id="s6-3">6.3 路由版本栅栏（Fencing）</h3>
-  <p>每次请求携带 <code>RequestHeader.routeVersion</code>，服务端在 <code>preExecuteCallBack</code> 三向比对：</p>
-  <table>
-    <tr><th>比较</th><th>含义</th><th>动作</th></tr>
-    <tr><td><code>server &gt; client</code></td><td>客户端路由过期</td><td>回 <code>CLIENT_ROUTE_OUT_OF_DATE</code>，客户端向 OM 拉新路由后重试。</td></tr>
-    <tr><td><code>server &lt; client</code></td><td>服务端路由过期</td><td>服务端异步 <code>refreshRouteInfo()</code>，回 <code>SERVER_ROUTE_OUT_OF_DATE</code> 让客户端重试。</td></tr>
-    <tr><td><code>相等但 key 不属本集群</code></td><td>切流后残留请求</td><td>回 <code>WRONG_ROUTE</code> 或 <code>MIGRATED_ROUTE</code>+目标地址。</td></tr>
-  </table>
-  <p>该栅栏保证：<strong>无论客户端/服务端谁的视图旧，最终都收敛到最新路由且请求最终成功</strong>，是不断流的兜底。此机制现状已实现，动态分片直接复用。<span class="pill src">ObjectStore.cpp:120-135</span></p>
+  <h3 id="s6-3">6.3 原子切流（唯一权威的移交）</h3>
+  <p>切流（P3）是把某分片的"权威集群"从源改为目标的<strong>原子时刻</strong>，用 OM 一条 Raft 事务完成，保证不存在"源与目标同时接受该分片写"的双主窗口：</p>
+  <ul>
+    <li>事务提交前：分片仍属源集群，源为权威（此时目标处于 <code>IMPORTING</code>，仅接收迁移写，不对外服务该分片）。</li>
+    <li>事务提交后：<code>routeVersion++</code>，分片归属=目标；源集群对该分片的后续请求一律转为重定向（见第 7 节），不再本地落库。</li>
+  </ul>
+  <p>由于切流以<strong>分片为最小单位</strong>提交，一次可只切一个或一小批分片，失败仅影响该分片且可回滚（routeVersion 不提升即视图不变）。这满足不变式 I2/I4。</p>
 </section>
 
 <!-- ============ 7 ============ -->
 <section id="s7">
-  <h2><span class="num">7</span>端到端流程示例（扩容 + 分裂）</h2>
-  <p>场景：集群 C1 承载全部分片并出现热点，新增集群 C2，并把热点槽分裂后迁移部分到 C2。</p>
-  <div class="fig">
-    <svg viewBox="0 0 1000 470" width="100%" role="img" aria-label="端到端时序图">
-      <!-- lifelines -->
-      <g font-size="13" text-anchor="middle" fill="#cfe0ff">
-        <text x="90" y="28">Client</text>
-        <text x="300" y="28">OM (Rebalancer)</text>
-        <text x="560" y="28">C1 (Source OS)</text>
-        <text x="820" y="28">C2 (Target OS)</text>
-      </g>
-      <g stroke="#2b3855" stroke-width="1.5" stroke-dasharray="4 4">
-        <line x1="90" y1="40" x2="90" y2="450"/>
-        <line x1="300" y1="40" x2="300" y2="450"/>
-        <line x1="560" y1="40" x2="560" y2="450"/>
-        <line x1="820" y1="40" x2="820" y2="450"/>
-      </g>
-      <defs><marker id="m" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4da3ff"/></marker>
-      <marker id="mg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#7bd88f"/></marker></defs>
-      <g font-size="11.5" fill="#9fb0cd">
-        <!-- addCluster -->
-        <line x1="300" y1="70" x2="820" y2="70" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
-        <text x="560" y="63" text-anchor="middle">① addCluster(C2)：登记新集群，HashRing 算出待迁分片</text>
-        <!-- prepare split -->
-        <line x1="300" y1="105" x2="300" y2="105"/>
-        <rect x="255" y="95" width="90" height="22" rx="6" fill="#12233a" stroke="#2b3855"/>
-        <text x="300" y="110" text-anchor="middle" fill="#8fc3ff">② Prepare Split</text>
-        <text x="300" y="132" text-anchor="middle">ShardCatalog: d→d+1, 状态 SPLITTING（routeVer 不变）</text>
-        <!-- P1 copy -->
-        <line x1="300" y1="160" x2="560" y2="160" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
-        <text x="430" y="153" text-anchor="middle">③ StartMigration(task)</text>
-        <line x1="560" y1="185" x2="820" y2="185" stroke="#7bd88f" stroke-width="1.6" marker-end="url(#mg)"/>
-        <text x="690" y="178" text-anchor="middle">④ P1 Scan + MigrateBatch（存量快照）</text>
-        <!-- normal traffic -->
-        <line x1="90" y1="215" x2="560" y2="215" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
-        <text x="325" y="208" text-anchor="middle">⑤ 读写照常 → C1 服务（不断流）</text>
-        <!-- P2 dual write -->
-        <line x1="560" y1="245" x2="820" y2="245" stroke="#7bd88f" stroke-width="1.6" marker-end="url(#mg)"/>
-        <text x="690" y="238" text-anchor="middle">⑥ P2 增量双写，lag→0</text>
-        <!-- report -->
-        <line x1="560" y1="275" x2="300" y2="275" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
-        <text x="430" y="268" text-anchor="middle">⑦ reportMigration(SUCCEEDED)</text>
-        <!-- switch -->
-        <rect x="250" y="295" width="100" height="22" rx="6" fill="#2b2412" stroke="#2b3855"/>
-        <text x="300" y="310" text-anchor="middle" fill="#ffd98a">⑧ P3 Switch</text>
-        <text x="300" y="332" text-anchor="middle">Raft 事务：placement 改，routeVersion++</text>
-        <!-- endMigration -->
-        <line x1="300" y1="355" x2="560" y2="355" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
-        <line x1="300" y1="358" x2="820" y2="358" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
-        <text x="560" y="349" text-anchor="middle">⑨ EndMigration(新 RouteInfo)</text>
-        <!-- redirect -->
-        <line x1="90" y1="390" x2="560" y2="390" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
-        <line x1="560" y1="412" x2="90" y2="412" stroke="#ffcc6b" stroke-width="1.6" marker-end="url(#m)"/>
-        <text x="325" y="405" text-anchor="middle">⑩ 旧 routeVer 请求命中 C1 → MIGRATED_ROUTE(C2)</text>
-        <line x1="90" y1="438" x2="820" y2="438" stroke="#7bd88f" stroke-width="1.6" marker-end="url(#mg)"/>
-        <text x="455" y="431" text-anchor="middle">⑪ 客户端重定向 → C2 服务（切流完成）</text>
-      </g>
-    </svg>
-    <div class="cap">图 7-1　扩容 + 分裂 + 迁移端到端时序（全程读写不中断）</div>
+  <h2><span class="num">7</span>迁移期读写请求处理（正在被迁移的分片）</h2>
+  <p>本节回答需求的第二问：<strong>当一个分片正在迁移时，落到它上面的读写请求如何处理</strong>。核心机制<strong>现状已实现</strong>于 <code>ObjectStore::preExecuteCallBack()</code>：先做路由版本栅栏，再按本集群角色（<code>EXPORTING</code> 源 / <code>IMPORTING</code> 目标）逐 key 判定放行或重定向。<span class="pill src">ObjectStore.cpp:109-191</span></p>
+
+  <h3 id="s7-1">7.1 路由版本栅栏（Fencing）</h3>
+  <p>每个请求携带 <code>RequestHeader.routeVersion</code>；服务端与本地 <code>routeVersion</code> 三向比对，先解决"谁的路由视图旧"：</p>
+  <table>
+    <tr><th>比较</th><th>含义</th><th>动作</th></tr>
+    <tr><td><code>server &gt; client</code></td><td>客户端路由过期</td><td>回 <code>CLIENT_ROUTE_OUT_OF_DATE</code>，客户端向 OM 拉新 <code>RouteInfo</code> 后重试。<span class="pill src">ObjectStore.cpp:120-123</span></td></tr>
+    <tr><td><code>server &lt; client</code></td><td>服务端路由过期</td><td>服务端异步 <code>refreshRouteInfo()</code>，回 <code>SERVER_ROUTE_OUT_OF_DATE</code> 让客户端稍后重试。<span class="pill src">ObjectStore.cpp:125-131</span></td></tr>
+    <tr><td><code>相等</code></td><td>视图一致</td><td>进入下面的 per-shard 归属判定（7.2 / 7.3）。</td></tr>
+  </table>
+  <p>该栅栏保证：无论客户端或服务端谁的视图旧，最终都收敛到最新路由，请求最终成功——这是不断流的兜底。</p>
+
+  <h3 id="s7-2">7.2 源集群侧（EXPORTING）：切流前服务、切流后重定向</h3>
+  <p>迁移中分片的源集群状态为 <code>EXPORTING</code>。对落到迁移分片的 key，源集群按"该 key 是否已被迁走"分流：</p>
+  <div class="callout">
+    <span class="tag">源集群逻辑（已实现）</span>
+    <ul style="margin:6px 0 0">
+      <li>若 key 的分片<strong>仍属本集群</strong>（未切流）→ 正常本地读写，由源服务。</li>
+      <li>若本集群状态 <code>EXPORTING</code> 且该分片在迁移集合中 → 读该 key 的 meta：
+        <ul>
+          <li><code>readMeta</code> 命中（本地仍有）→ 尚未迁走，<strong>本地服务</strong>。</li>
+          <li><code>readMeta</code> 返回 <code>NotFound</code>（已迁并删除）→ 回 <code>MIGRATED_ROUTE</code> + 目标集群地址（<code>getTargetCluster()</code>），客户端据此<strong>重定向到目标集群</strong>重试。<span class="pill src">ObjectStore.cpp:172-186</span></li>
+        </ul>
+      </li>
+    </ul>
+  </div>
+  <p>因此在源集群侧，一个迁移分片的读写始终有确定去向：数据还在就地服务，数据已迁就重定向，绝不出现"两边都不认"或"两边都认"。</p>
+
+  <h3 id="s7-3">7.3 目标集群侧（IMPORTING）：接管中的分片放行</h3>
+  <p>目标集群状态为 <code>IMPORTING</code>。它尚未在最新 <code>RouteInfo</code> 中正式拥有该分片（切流前），但为了承接 P1/P2 的迁移写、以及切流后被重定向来的请求，需要对"正在接管的分片"放行：</p>
+  <div class="callout">
+    <span class="tag">目标集群逻辑（已实现）</span>
+    <ul style="margin:6px 0 0">
+      <li>若 key 的分片<strong>按 RouteInfo 尚不属本集群</strong>，但本集群 <code>IMPORTING</code> 且该分片在迁移集合中 → <strong>放行</strong>（<code>continue</code>），允许本地处理（承接迁移写入与被重定向的请求）。<span class="pill src">ObjectStore.cpp:161-169</span></li>
+      <li>若分片既不属本集群、又不在接管集合 → 回 <code>WRONG_ROUTE</code>，让客户端纠正路由。</li>
+    </ul>
+  </div>
+
+  <h3 id="s7-4">7.4 读写决策全表</h3>
+  <table>
+    <tr><th>本集群角色</th><th>分片归属（RouteInfo）</th><th>在迁移集合?</th><th>key 是否已迁走</th><th>动作</th></tr>
+    <tr><td>任意</td><td>—</td><td>—</td><td>—</td><td>routeVersion 不一致 → <code>*_ROUTE_OUT_OF_DATE</code>，刷新后重试</td></tr>
+    <tr><td>源（EXPORTING）</td><td>属本集群</td><td>是</td><td>否（meta 命中）</td><td><b>本地读写</b>（切流前源服务）</td></tr>
+    <tr><td>源（EXPORTING）</td><td>属本集群</td><td>是</td><td>是（meta NotFound）</td><td><code>MIGRATED_ROUTE</code>+目标地址 → 客户端重定向</td></tr>
+    <tr><td>目标（IMPORTING）</td><td>不属本集群</td><td>是</td><td>—</td><td><b>放行本地处理</b>（承接迁移写 / 切流后请求）</td></tr>
+    <tr><td>任意</td><td>不属本集群</td><td>否</td><td>—</td><td><code>WRONG_ROUTE</code> → 客户端纠正路由</td></tr>
+    <tr><td>目标（切流后 IN_SERVICE）</td><td>属本集群</td><td>—</td><td>—</td><td><b>本地读写</b>（迁移完成，目标常态服务）</td></tr>
+  </table>
+  <div class="callout good">
+    <span class="tag">为什么不断流</span>
+    ① 切流是分片级原子事务，任一时刻分片只有<strong>一个权威集群</strong>；② 切流前源服务、切流后目标服务，中间无空窗；③ 落到"旧集群"的残留请求被 <code>MIGRATED_ROUTE</code> 一跳重定向到目标；④ 客户端/服务端路由错位被版本栅栏兜底重试。四者叠加 → 迁移分片的读写<strong>全程可服务、结果强一致</strong>。
   </div>
 </section>
 
 <!-- ============ 8 ============ -->
 <section id="s8">
-  <h2><span class="num">8</span>Proto 与接口变更</h2>
-  <p>遵循向后兼容原则（proto3 加字段不破坏旧节点）：</p>
+  <h2><span class="num">8</span>端到端流程示例（扩容 M→N）</h2>
+  <p>场景：集群 C1 承载部分分片、容量吃紧，新增集群 C2，把 HashRing 算出的一段分片从 C1 迁到 C2，全程读写不中断。</p>
+  <div class="fig">
+    <svg viewBox="0 0 1000 470" width="100%" role="img" aria-label="扩容端到端时序图">
+      <g font-size="13" text-anchor="middle" fill="#cfe0ff">
+        <text x="90" y="28">Client</text>
+        <text x="300" y="28">OM (ClusterSetManager)</text>
+        <text x="560" y="28">C1 (Source OS · EXPORTING)</text>
+        <text x="850" y="28">C2 (Target OS · IMPORTING)</text>
+      </g>
+      <g stroke="#2b3855" stroke-width="1.5" stroke-dasharray="4 4">
+        <line x1="90" y1="40" x2="90" y2="450"/>
+        <line x1="300" y1="40" x2="300" y2="450"/>
+        <line x1="560" y1="40" x2="560" y2="450"/>
+        <line x1="850" y1="40" x2="850" y2="450"/>
+      </g>
+      <defs><marker id="m" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#4da3ff"/></marker>
+      <marker id="mg" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#7bd88f"/></marker></defs>
+      <g font-size="11.5" fill="#9fb0cd">
+        <line x1="300" y1="70" x2="850" y2="70" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
+        <text x="575" y="63" text-anchor="middle">① onboardCluster(C2)：置 IN_SERVICE，HashRing 算出待迁分片</text>
+        <rect x="250" y="90" width="100" height="22" rx="6" fill="#12233a" stroke="#2b3855"/>
+        <text x="300" y="105" text-anchor="middle" fill="#8fc3ff">② 建迁移任务</text>
+        <text x="300" y="128" text-anchor="middle">Raft 事务：C1→EXPORTING, C2→IMPORTING（routeVer 不变）</text>
+        <line x1="300" y1="155" x2="560" y2="155" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
+        <text x="430" y="148" text-anchor="middle">③ StartMigration(shards)</text>
+        <line x1="560" y1="180" x2="850" y2="180" stroke="#7bd88f" stroke-width="1.6" marker-end="url(#mg)"/>
+        <text x="700" y="173" text-anchor="middle">④ P1 Scan + MigrateBatch（存量快照，幂等）</text>
+        <line x1="90" y1="210" x2="560" y2="210" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
+        <text x="325" y="203" text-anchor="middle">⑤ 读写照常 → C1 服务（迁移分片仍归 C1）</text>
+        <line x1="560" y1="240" x2="850" y2="240" stroke="#7bd88f" stroke-width="1.6" marker-end="url(#mg)"/>
+        <text x="700" y="233" text-anchor="middle">⑥ P2 增量转发，lag→0</text>
+        <line x1="560" y1="270" x2="300" y2="270" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
+        <text x="430" y="263" text-anchor="middle">⑦ reportMigration(SUCCEEDED)</text>
+        <rect x="248" y="290" width="104" height="22" rx="6" fill="#2b2412" stroke="#2b3855"/>
+        <text x="300" y="305" text-anchor="middle" fill="#ffd98a">⑧ P3 原子切流</text>
+        <text x="300" y="328" text-anchor="middle">Raft 事务：分片归属→C2，routeVersion++</text>
+        <line x1="300" y1="352" x2="560" y2="352" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
+        <line x1="300" y1="356" x2="850" y2="356" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
+        <text x="575" y="346" text-anchor="middle">⑨ EndMigration：C2→IN_SERVICE，下发新 RouteInfo；C1 清理已迁数据</text>
+        <line x1="90" y1="388" x2="560" y2="388" stroke="#4da3ff" stroke-width="1.6" marker-end="url(#m)"/>
+        <line x1="560" y1="410" x2="90" y2="410" stroke="#ffcc6b" stroke-width="1.6" marker-end="url(#m)"/>
+        <text x="325" y="403" text-anchor="middle">⑩ 持旧路由的请求命中 C1 → MIGRATED_ROUTE(C2)</text>
+        <line x1="90" y1="438" x2="850" y2="438" stroke="#7bd88f" stroke-width="1.6" marker-end="url(#mg)"/>
+        <text x="470" y="431" text-anchor="middle">⑪ 客户端重定向 → C2 服务（切流完成，不断流）</text>
+      </g>
+    </svg>
+    <div class="cap">图 8-1　扩容 + 迁移端到端时序（全程读写不中断；缩容为其镜像）</div>
+  </div>
+</section>
+
+
+<!-- ============ 9 ============ -->
+<section id="s9">
+  <h2><span class="num">9</span>Proto 与接口变更</h2>
+  <p>遵循向后兼容原则（proto3 加字段不破坏旧节点）。由于<strong>分片总数固定为 4096、不做分裂/合并</strong>，改动面很小，主要是"打通已有能力"而非引入新分片模型：</p>
 
   <h4><code>common.proto</code></h4>
   <table>
     <tr><th>消息</th><th>变更</th></tr>
-    <tr><td><code>Shard</code></td><td><span class="pill chg">改</span> 移除对 <code>ShardFactor.DEFAULT=12</code> 的硬依赖；新增 <code>uint32 slotBits (M)</code> 与每分片 <code>uint32 splitDepth (d)</code>。</td></tr>
-    <tr><td><code>Partition</code></td><td><span class="pill chg">改</span> <code>allShards</code> 从"固定 4096"改为动态列表；新增 <code>uint32 slotBits</code> 供客户端计算 SlotId。</td></tr>
-    <tr><td><code>ShardCatalog</code> <span class="pill new">新增</span></td><td>全局分片目录：<code>map&lt;SlotId, SlotMeta{depth, shards[]}&gt;</code>，每个 shard 含状态与归属集群。持久化于 OM。</td></tr>
-    <tr><td><code>Migration.MigrationTask</code></td><td><span class="pill chg">改</span> 新增 <code>MigrationType {PLACEMENT, SPLIT, MERGE}</code>；支持一个任务携带"槽内子 range"。</td></tr>
-    <tr><td><code>Cluster.ClusterSetGlobalInfo</code></td><td><span class="pill chg">改</span> 允许 <code>migrationTaskIds</code> 多任务并发（现状假设单任务）。</td></tr>
+    <tr><td><code>Cluster.ClusterStatus</code></td><td><span class="pill new">复用</span> 已有 <code>IN_SERVICE / EXPORTING / IMPORTING / OUT_OF_SERVICE</code> 恰好覆盖迁移期的源/目标/下线角色，无需新增。<span class="pill src">common.proto:123-129</span></td></tr>
+    <tr><td><code>Cluster.ClusterSetGlobalInfo</code></td><td><span class="pill chg">改</span> 允许 <code>migrationTaskIds</code> 承载<strong>多个并发迁移任务</strong>（现状 <code>fillRouteAndMigrationInfo()</code> 只取第一个）。</td></tr>
+    <tr><td><code>Migration.MigrationTask</code></td><td><span class="pill new">复用</span> 现有"源集群 + 目标集群 + 分片列表"结构即可表达一次分片重划分；无需 MigrationType/Split/Merge 字段。</td></tr>
+    <tr><td><code>Shard / Partition</code></td><td><span class="pill" style="background:#122b1c;color:#8fe0a3">不变</span> <code>ShardFactor.DEFAULT=12</code>（4096 分片）与 key→shard 算法保持原样。</td></tr>
   </table>
 
   <h4>服务接口（<code>control.proto</code> / <code>RequestReceiver</code>）</h4>
   <ul>
-    <li><span class="pill new">新增</span> <code>MigrateBatchCallData</code>：补齐服务端接收器，落地导出方发来的批数据（当前缺失，是闭环关键）。<span class="pill src">RequestReceiver.cpp:76-84</span></li>
-    <li><span class="pill new">新增</span> <code>SplitShard</code> / <code>MergeShard</code> 管控 RPC（OM ↔ OS）。</li>
-    <li><span class="pill chg">扩展</span> <code>StartMigration/EndMigration</code> 携带 <code>MigrationType</code>；<code>reportMigrationProgress</code> 支持多任务并发上报。</li>
+    <li><span class="pill new">新增</span> <code>MigrateBatchCallData</code>：补齐服务端接收器，落地导出方 <code>migrateBatch()</code> 发来的批数据，以 <code>(key,version)</code> 幂等 upsert。<strong>这是当前缺失、闭环的关键。</strong><span class="pill src">RequestReceiver.cpp:76-84</span></li>
+    <li><span class="pill chg">扩展</span> <code>reportMigrationProgress</code> / <code>Start/EndMigration</code> 支持<strong>多任务并发</strong>上报与结算（一次扩缩容涉及多个源集群）。</li>
+    <li><span class="pill" style="background:#122b1c;color:#8fe0a3">不新增</span> 无需 <code>SplitShard/MergeShard</code> 之类 RPC。</li>
   </ul>
 
   <h4>OM 代码打通点</h4>
   <ul>
-    <li>取消注释并实现 <code>ClusterSetManager::onboardCluster()</code> 中的迁移任务生成逻辑。<span class="pill src">ClusterSetManager.cpp:412-433</span></li>
-    <li>实现 <code>removeCluster()</code>（当前为空）以支持缩容。<span class="pill src">ClusterSetManager.cpp:297-300</span></li>
-    <li><code>HashRing</code> 从固定 <code>RING_LENGTH=4096</code> 泛化为可配置 <code>2<sup>M</sup></code>，并在动态 ShardId 空间上工作。<span class="pill src">HashRing.h:52</span></li>
+    <li>取消注释并实现 <code>ClusterSetManager::onboardCluster()</code> 中的迁移任务生成逻辑（扩容）。<span class="pill src">ClusterSetManager.cpp:412-433</span></li>
+    <li>实现 <code>removeCluster()</code>（当前为空）以支持缩容：<code>deleteClusterId()</code> + 反推落点 + 迁空后摘除。<span class="pill src">ClusterSetManager.cpp:297-300</span></li>
+    <li>解除"同一时刻只有一个迁移任务"的假设，支持并发多任务。<span class="pill src">ClusterSetManager.cpp:386-393</span></li>
   </ul>
-</section>
-
-<!-- ============ 9 ============ -->
-<section id="s9">
-  <h2><span class="num">9</span>容错与幂等</h2>
-  <table>
-    <tr><th style="width:24%">故障场景</th><th>处理</th></tr>
-    <tr><td>源 OS 迁移中宕机</td><td>迁移任务持久化于 OM；新 leader 从 ShardCatalog 状态恢复，未完成的 shard 重新 <code>ScanTask</code>。<code>MigrateBatch</code> 幂等，重复导出安全。</td></tr>
-    <tr><td>目标 OS 宕机</td><td>Raft 保证目标集群自愈；<code>exportLocalKeys</code> 重试直至 ACK 成功后才删源，无数据丢失。<span class="pill src">MigrationManager.cpp:107-126</span></td></tr>
-    <tr><td>OM leader 切换</td><td>OM 为 Raft 集群；迁移编排状态在日志中，新 leader 续跑，得益于 event-sourcing 的状态可复现。</td></tr>
-    <tr><td>Switch 事务失败</td><td>routeVersion 不提升 → 视图保持切流前状态 → 迁移可安全重试或整体回滚到 <code>NORMAL</code>。</td></tr>
-    <tr><td>客户端持极旧路由</td><td>路由版本栅栏保证多跳重定向后最终命中，最坏情况多几次重试，不返回错误结果。</td></tr>
-    <tr><td>删除失败残留</td><td><code>deleteLocalKeys</code> 失败的 key 重新入队 <code>ScanTask</code> 重删，幂等收敛。<span class="pill src">MigrationManager.cpp:151-158</span></td></tr>
-  </table>
-  <div class="callout good">
-    <span class="tag">正确性不变式</span>
-    ① 任一时刻每个 key 恰有一个"权威分片"提供强一致读写；② 切流是原子 Raft 事务，无双主写窗口；③ 先复制确认、后删除源，保证不丢；④ 版本幂等保证不重、乱序收敛。
-  </div>
 </section>
 
 <!-- ============ 10 ============ -->
 <section id="s10">
-  <h2><span class="num">10</span>可用性与限流</h2>
-  <ul>
-    <li><strong>后台低优先级迁移</strong>：<code>MigrationManager</code> 使用独立线程池（现 <code>kMigrationThreadNum=10</code>），迁移与前台请求隔离；引入可配置的<strong>批大小/速率限流</strong>（如每秒 MigrateBatch 条数），避免抢占前台 IO。<span class="pill src">MigrationManager.h:135</span></li>
-    <li><strong>小步分批</strong>：<code>ScanTask</code> 已按 <code>kScanMaxBatch=100</code> 分批扫描，天然增量、可暂停/续传。</li>
-    <li><strong>并发控制</strong>：Rebalancer 限制全局并发迁移任务数，优先保证在迁移集群的前台 SLA。</li>
-    <li><strong>热点感知调度</strong>：借鉴 DynamoDB/TiKV，Rebalancer 依据分片 QPS 与容量指标选择分裂点与迁移目标，避免"迁完仍热"。</li>
-    <li><strong>灰度切流</strong>：Switch 以分片为最小单位逐个提交，单次切流影响面小；失败只影响该分片且可回滚。</li>
-    <li><strong>可观测性</strong>：复用 <code>reportMigration</code> 进度上报 + Prometheus 指标（迁移 lag、剩余分片、重定向率）供运维决策。</li>
-  </ul>
+  <h2><span class="num">10</span>容错与幂等</h2>
+  <table>
+    <tr><th style="width:24%">故障场景</th><th>处理</th></tr>
+    <tr><td>源 OS 迁移中宕机</td><td>迁移任务持久化于 OM；OS 新 leader 恢复后，未完成分片重新 <code>ScanTask→ExportTask</code>。<code>MigrateBatch</code> 幂等，重复导出安全。</td></tr>
+    <tr><td>目标 OS 宕机</td><td>Raft 保证目标集群自愈；<code>exportLocalKeys</code> 重试直至 ACK 成功后才删源，无数据丢失。<span class="pill src">MigrationManager.cpp:100-124</span></td></tr>
+    <tr><td>OM leader 切换</td><td>OM 为 Raft 集群；迁移编排状态在日志中，新 leader 续跑，得益于 event-sourcing 的状态可复现。</td></tr>
+    <tr><td>切流事务失败</td><td><code>routeVersion</code> 不提升 → 视图保持切流前状态 → 迁移可安全重试或整体回滚（分片归属退回源集群）。</td></tr>
+    <tr><td>客户端持极旧路由</td><td>路由版本栅栏 + <code>MIGRATED_ROUTE</code> 保证多跳重定向后最终命中，最坏多几次重试，绝不返回错误结果。</td></tr>
+    <tr><td>删除失败残留</td><td><code>deleteLocalKeys</code> 失败的 key 重新入队 <code>ScanTask</code> 重删，幂等收敛。<span class="pill src">MigrationManager.cpp:143-162</span></td></tr>
+  </table>
+  <div class="callout good">
+    <span class="tag">正确性不变式</span>
+    ① 任一时刻每个分片恰有一个"权威集群"提供强一致读写；② 切流是原子 Raft 事务，无双主写窗口；③ 先复制确认、后删除源，保证不丢；④ 版本幂等保证不重、乱序收敛。
+  </div>
 </section>
 
 <!-- ============ 11 ============ -->
 <section id="s11">
-  <h2><span class="num">11</span>分阶段实施计划</h2>
-  <table>
-    <tr><th style="width:8%">阶段</th><th style="width:24%">目标</th><th>主要工作</th></tr>
-    <tr><td><b>M1</b></td><td>打通 Placement 迁移（分片数不变）</td><td>补 <code>MigrateBatchCallData</code>；取消注释 <code>onboardCluster</code> 迁移逻辑；打通 Start/End/Report 全链路；端到端验证新增集群后数据真正迁移、不断流。</td></tr>
-    <tr><td><b>M2</b></td><td>缩容支持</td><td>实现 <code>removeCluster()</code>；下线集群前把其分片迁往其余集群；HashRing 删除节点重平衡。</td></tr>
-    <tr><td><b>M3</b></td><td>引入分层分片模型</td><td>落地 SlotId + splitDepth 编码；<code>ShardCatalog</code>；<code>keyToShardId</code>/<code>shardIdToColumnFamily</code>/客户端 <code>ShardingInfo</code> 改为读 RouteInfo 动态参数；默认 <code>d=0</code> 零迁移兼容。</td></tr>
-    <tr><td><b>M4</b></td><td>Shard 分裂</td><td>SplitShard RPC + 状态机 + 双写追平 + 原子切流；容量/热点触发器。</td></tr>
-    <tr><td><b>M5</b></td><td>Shard 合并</td><td>Buddy-merge RPC + 状态机；低负载/缩容触发。</td></tr>
-    <tr><td><b>M6</b></td><td>调度器与限流</td><td>Rebalancer 自动决策；并发多任务；速率限流；可观测性与灰度开关。</td></tr>
-  </table>
-  <p class="footnote">M1–M2 复用现有脚手架、改造面小、收益最大，建议优先落地；M3 起进入真正的"分片数动态变化"。</p>
+  <h2><span class="num">11</span>可用性与限流</h2>
+  <ul>
+    <li><strong>后台低优先级迁移</strong>：<code>MigrationManager</code> 使用独立线程池，迁移与前台请求隔离；引入可配置的<strong>批大小/速率限流</strong>（如每秒 <code>MigrateBatch</code> 条数），避免抢占前台 IO。</li>
+    <li><strong>小步分批</strong>：<code>ScanTask</code> 已按 <code>kScanMaxBatch=100</code> 分批扫描，天然增量、可暂停/续传。<span class="pill src">MigrationManager.cpp:42-70</span></li>
+    <li><strong>并发控制</strong>：Rebalancer 限制全局并发迁移任务数，优先保证在迁移集群的前台 SLA。</li>
+    <li><strong>灰度切流</strong>：切流以分片为最小单位逐个/逐批提交，单次影响面小；失败只影响该分片且可回滚。</li>
+    <li><strong>可观测性</strong>：复用 <code>reportMigration</code> 进度上报 + Prometheus 指标（迁移 lag、剩余分片数、重定向率、每集群分片数）供运维决策与扩缩容触发。</li>
+  </ul>
 </section>
 
 <!-- ============ 12 ============ -->
 <section id="s12">
-  <h2><span class="num">12</span>风险与权衡</h2>
+  <h2><span class="num">12</span>分阶段实施计划</h2>
   <table>
-    <tr><th style="width:26%">议题</th><th>权衡与选择</th></tr>
-    <tr><td>逻辑槽 M 的取值</td><td>M 太小限制最大集群数；太大增加元数据。建议 M=14（16384 槽），对齐 Redis 经验且留足扩展空间。分裂深度按需局部增长，不必全局提高 M。</td></tr>
-    <tr><td>原地分裂 vs 跨集群分裂</td><td>原地分裂仅重打列族标签，几乎零成本，适合先分裂再择机迁移；跨集群分裂 = 分裂 + 迁移，成本高但一步到位。方案两者皆支持，由 Rebalancer 择优。</td></tr>
-    <tr><td>双写开销</td><td>P2 双写增加写放大与延迟。通过限流、仅对迁移中分片开启、lag 收敛后尽快切流来控制窗口。</td></tr>
-    <tr><td>跨分片事务</td><td>分裂/合并可能改变 key 的分片归属，影响 <code>RMSTRX</code> 迷你事务定位（现固定 <code>RMSTRX_SHARD_IDX</code>）。需保证事务键的分片在迁移期间的一致定位，必要时对事务键所在槽禁用分裂。<span class="pill src">ObjectStore.h:47-48</span></td></tr>
-    <tr><td>客户端兼容</td><td>老客户端用固定 shardFactor。通过 routeVersion 栅栏可容忍其暂时落后；建议客户端升级为读取 RouteInfo 动态槽参数。</td></tr>
+    <tr><th style="width:8%">阶段</th><th style="width:26%">目标</th><th>主要工作</th></tr>
+    <tr><td><b>M1</b></td><td>打通扩容迁移闭环</td><td>补 <code>MigrateBatchCallData</code>（服务端接收 + 幂等 upsert）；取消注释 <code>onboardCluster()</code> 迁移任务生成；打通 Start/End/Report 全链路；端到端验证"新增集群 → 分片真正迁移 → 不断流"。</td></tr>
+    <tr><td><b>M2</b></td><td>缩容支持</td><td>实现 <code>removeCluster()</code>：<code>deleteClusterId()</code> 重排 + 反推落点 + 迁空确认后摘除；验证下线集群不再被路由。</td></tr>
+    <tr><td><b>M3</b></td><td>并发多任务</td><td>解除"单任务"假设；<code>ClusterSetGlobalInfo</code> 与 <code>fillRouteAndMigrationInfo()</code> 支持并发迁移；一次扩缩容多源并行。</td></tr>
+    <tr><td><b>M4</b></td><td>限流与可观测</td><td>迁移速率/批大小限流；lag、剩余分片、重定向率等指标；灰度切流开关；失败回滚演练。</td></tr>
+    <tr><td><b>M5</b></td><td>自动重平衡（可选）</td><td>Rebalancer 依据各集群容量/QPS 指标自动建议扩缩容与分片再均衡（人工审批触发）。</td></tr>
   </table>
+  <p class="footnote">M1–M2 复用现有脚手架、改造面小、收益最大，建议优先落地即可获得"集群数 M→N"的弹性能力。</p>
 </section>
 
 <!-- ============ 13 ============ -->
 <section id="s13">
-  <h2><span class="num">13</span>附录：与开源方案对比</h2>
+  <h2><span class="num">13</span>风险与权衡</h2>
   <table>
-    <tr><th>能力</th><th>Redis Cluster</th><th>Vitess</th><th>TiKV/PD</th><th>本方案（Goblin）</th></tr>
-    <tr><td>分片单元</td><td>16384 固定槽</td><td>keyrange</td><td>Region(range)</td><td>逻辑槽 + 可变分裂深度</td></tr>
-    <tr><td>分片数可增</td><td>否(槽固定)</td><td>是</td><td>是(split)</td><td><b>是(split)</b></td></tr>
-    <tr><td>分片数可减</td><td>否</td><td>是</td><td>是(merge)</td><td><b>是(buddy-merge)</b></td></tr>
-    <tr><td>不断流迁移</td><td>是(ASK/MOVED)</td><td>是(VReplication)</td><td>是</td><td><b>是(4 阶段+版本栅栏)</b></td></tr>
-    <tr><td>中心调度</td><td>弱(手动)</td><td>vtctld</td><td>PD</td><td>OM Rebalancer</td></tr>
-    <tr><td>客户端重定向</td><td>MOVED/ASK</td><td>代理层</td><td>PD 缓存</td><td><b>已有 MIGRATED_ROUTE</b></td></tr>
-    <tr><td>状态可复现</td><td>否</td><td>部分</td><td>Raft</td><td><b>event-sourcing 全量</b></td></tr>
+    <tr><th style="width:26%">议题</th><th>权衡与选择</th></tr>
+    <tr><td>迁移期写放大</td><td>P2 增量转发使迁移中分片的写多发一份到目标。通过限流、仅对迁移中分片开启、lag 收敛后尽快切流来压缩窗口；分片总数固定意味着单次迁移集合有界，可控。</td></tr>
+    <tr><td>迁移粒度=分片</td><td>分片是迁移最小单位，若单个分片数据特别大，其迁移耗时较长。因 4096 分片粒度固定且较细（每分片约总量的 1/4096），单分片体量通常可接受；扫描已按 100 条分批、可续传。</td></tr>
+    <tr><td>并发迁移与路由缓存</td><td>多分片同时迁移时，客户端可能持有部分过期映射。路由版本栅栏 + <code>MIGRATED_ROUTE</code> 保证任何错位都能一跳纠正，代价是迁移窗口内少量重试。</td></tr>
+    <tr><td>迷你事务键定位</td><td><code>RMSTRX</code> 迷你事务的键被硬编码到固定分片 <code>RMSTRX_SHARD_IDX</code>。该分片若被重划分到新集群，需保证切流前后事务键的一致定位（沿用同一 shardId→cluster 路由即可，无特殊处理）。<span class="pill src">ObjectStore.h:47-48</span></td></tr>
+    <tr><td>缩容摘除时机</td><td>必须"先迁空、路由全部刷新、无残留请求"后才停机下线集群，否则残留请求会命中已停机节点。以 <code>OUT_OF_SERVICE</code> 状态过渡并等待 routeVersion 收敛。</td></tr>
+    <tr><td>与开源对比</td><td>模型等价于 <strong>Redis Cluster 固定槽 + 槽→节点重映射</strong>：分片数不变、只搬归属、客户端重定向。相比 TiKV/Vitess 的 range split 更简单，恰好匹配"只改集群数"的需求。</td></tr>
   </table>
   <div class="callout">
     <span class="tag">小结</span>
-    本方案以最小改造量，把 Goblin 从"静态 4096 分片"演进为"分片数可分裂/合并、集群可弹性伸缩、迁移全程不断流"的动态分片系统：<strong>M1–M2 打通既有脚手架即可获得集群弹性；M3–M6 引入分层分片模型实现真正的分片粒度动态化</strong>。所有一致性与可用性保障均建立在 Goblin 已有的 Raft、路由版本栅栏与 event-sourcing 之上，风险可控、演进平滑。
+    本方案把 Goblin 从"静态 M 集群"演进为"集群数可 M→N 弹性伸缩"的系统，<strong>分片总数固定为 4096、每个分片始终只属于一个集群</strong>。落地重点是打通既有迁移脚手架（补 <code>MigrateBatch</code> 接收端、启用 <code>onboardCluster</code> 重平衡、实现 <code>removeCluster</code>、支持并发多任务）。数据迁移用"复制→增量追平→原子切流→清理"四阶段保证不丢不重；迁移期读写用"路由版本栅栏 + EXPORTING/IMPORTING 逐分片判定 + MIGRATED_ROUTE 重定向"保证全程不断流。所有一致性保障均建立在 Goblin 已有的 Raft、路由栅栏与 event-sourcing 之上。
   </div>
 </section>
+
 
 <hr>
 <p class="footnote">本文档为设计方案，引用的源码位置基于当前仓库 <code>DongbinCheng/Goblin</code>。<span class="pill src">pill</span> 标注代码引用，<span class="pill new">新增</span>/<span class="pill chg">变更</span> 标注改造类型。</p>
